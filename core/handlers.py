@@ -185,8 +185,8 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
         logger.debug(f"[BilibiliAutoDetect] 开始处理视频: video_id={video_id}, page={page}")
         
         try:
-            # 获取是否启用总结的配置
-            enable_summary = self.get_config("analysis.enable_summary", True)
+            # 获取是否启用总结的配置（从summary节读取）
+            enable_summary = self.get_config("summary.enable_summary", True)
             logger.debug(f"[BilibiliAutoDetect] enable_summary={enable_summary}")
             
             # 构建缓存key（包含分P号）
@@ -523,8 +523,9 @@ class BilibiliCommandHandler(BaseCommand):
     async def execute(self) -> Tuple[bool, Optional[str], int]:
         """执行命令处理
         
-        命令模式：使用原生视频信息生成个性化回复并直接发送给用户
-        （永久跳过总结生成环节）
+        命令模式：
+        - enable_summary=true: 先生成总结，再基于总结生成个性化回复
+        - enable_summary=false: 直接基于原生信息生成个性化回复
         
         Returns:
             Tuple[bool, Optional[str], int]:
@@ -580,10 +581,14 @@ class BilibiliCommandHandler(BaseCommand):
             video_service = VideoService(self.video_parser, self.get_config)
             summary_service = SummaryService(self.video_analyzer, self.get_config)
             
+            # 获取是否启用总结的配置（从summary节读取）
+            enable_summary = self.get_config("summary.enable_summary", True)
+            logger.debug(f"[BilibiliCommand] enable_summary={enable_summary}")
+            
             # 构建缓存key（包含分P号）
             cache_key = f"{video_id}_p{page}" if page > 1 else video_id
             
-            # 检查缓存（命令模式使用原生信息）
+            # 检查缓存
             video_title = None
             video_duration = None
             video_total_duration = None
@@ -593,6 +598,7 @@ class BilibiliCommandHandler(BaseCommand):
             video_page_title = ""
             video_total_pages = 1
             raw_info = None
+            cached_summary = None  # 缓存的总结
             
             if self.get_config("video.cache_enabled", True) and self.cache_manager:
                 cached = self.cache_manager.get_cache(cache_key)
@@ -606,6 +612,7 @@ class BilibiliCommandHandler(BaseCommand):
                     video_page_title = cached.get('page_title', '')
                     video_total_pages = cached.get('total_pages', 1)
                     raw_info = cached.get('raw_info', {})
+                    cached_summary = cached.get('summary')  # 获取缓存的总结
             
             # 如果没有缓存或缓存中没有原生信息，处理视频
             if not raw_info:
@@ -696,12 +703,80 @@ class BilibiliCommandHandler(BaseCommand):
                 'total_pages': video_total_pages,
             }
             
-            # 使用原生信息生成个性化回复（跳过总结生成）
-            logger.debug("[BilibiliCommand] 生成个性化回复...")
-            personalized_reply = await summary_service.generate_personalized_reply_from_raw_info(
-                video_info=video_info_dict,
-                raw_info=raw_info
-            )
+            # 根据enable_summary配置决定是否生成总结
+            if enable_summary:
+                # 启用总结模式：先生成总结，再基于总结生成个性化回复
+                raw_summary = cached_summary  # 尝试使用缓存的总结
+                
+                if not raw_summary:
+                    # 缓存中没有总结，需要生成
+                    logger.debug("[BilibiliCommand] 生成视频总结...")
+                    
+                    # 获取视觉分析方式
+                    visual_method = self.get_config("analysis.visual_method", "default")
+                    
+                    # 获取文本内容
+                    text_content = raw_info.get('subtitle_text') or raw_info.get('asr_text', '')
+                    
+                    # 获取视觉分析结果
+                    visual_analysis = raw_info.get('visual_analysis', '')
+                    
+                    # 生成总结
+                    summary_result = await summary_service.generate_summary(
+                        frame_paths=[],  # 命令模式不重新抽帧，使用缓存的帧描述
+                        video_info=video_info_dict,
+                        text_content=text_content,
+                        visual_analysis=visual_analysis,
+                        visual_method=visual_method
+                    )
+                    
+                    if summary_result.success and summary_result.raw_summary:
+                        raw_summary = summary_result.raw_summary
+                        
+                        # 更新缓存，添加总结
+                        if self.get_config("video.cache_enabled", True) and self.cache_manager:
+                            cache_data = {
+                                "video_id": video_id,
+                                "page": video_page,
+                                "page_title": video_page_title,
+                                "total_pages": video_total_pages,
+                                "title": video_title,
+                                "author": video_author,
+                                "description": video_description,
+                                "duration": video_duration,
+                                "total_duration": video_total_duration,
+                                "raw_info": raw_info,
+                                "summary": raw_summary,
+                                "has_subtitle": bool(raw_info.get('subtitle_text')),
+                                "has_asr": bool(raw_info.get('asr_text'))
+                            }
+                            self.cache_manager.save_cache(cache_key, cache_data)
+                    else:
+                        logger.warning(f"[BilibiliCommand] 生成总结失败: {summary_result.error}")
+                        # 总结生成失败，回退到使用原生信息
+                        raw_summary = None
+                
+                if raw_summary:
+                    # 基于总结生成个性化回复
+                    logger.debug("[BilibiliCommand] 基于总结生成个性化回复...")
+                    personalized_reply = await summary_service.generate_personalized_reply(
+                        raw_summary=raw_summary,
+                        video_info=video_info_dict
+                    )
+                else:
+                    # 总结生成失败，回退到使用原生信息
+                    logger.debug("[BilibiliCommand] 总结生成失败，回退到使用原生信息...")
+                    personalized_reply = await summary_service.generate_personalized_reply_from_raw_info(
+                        video_info=video_info_dict,
+                        raw_info=raw_info
+                    )
+            else:
+                # 不启用总结模式：直接使用原生信息生成个性化回复
+                logger.debug("[BilibiliCommand] 基于原生信息生成个性化回复...")
+                personalized_reply = await summary_service.generate_personalized_reply_from_raw_info(
+                    video_info=video_info_dict,
+                    raw_info=raw_info
+                )
             
             # 将MessageRecv转换为DatabaseMessages用于引用回复
             reply_message = self._message_recv_to_database_messages()

@@ -110,6 +110,44 @@ class SummaryService:
         self._replyer_model = None
         self._replyer_model_checked = False
     
+    def _get_summary_max_chars(self) -> int:
+        """获取总结最大字数配置
+        
+        从配置中读取summary_max_chars，并进行校验：
+        - 如果是小数，自动取整
+        - 范围：60-6000
+        - 超出范围使用默认值200
+        
+        Returns:
+            校验后的总结最大字数
+        """
+        default_chars = 200
+        min_chars = 60
+        max_chars = 6000
+        
+        try:
+            value = self.get_config("summary.summary_max_chars", default_chars)
+            
+            # 如果是小数，自动取整
+            if isinstance(value, float):
+                value = int(value)
+                logger.debug(f"[SummaryService] summary_max_chars为小数，自动取整为{value}")
+            
+            if not isinstance(value, int):
+                logger.warning(f"[SummaryService] summary_max_chars类型错误({type(value)})，使用默认值{default_chars}")
+                return default_chars
+            
+            # 范围校验
+            if value < min_chars or value > max_chars:
+                logger.warning(f"[SummaryService] summary_max_chars超出范围({value})，使用默认值{default_chars}")
+                return default_chars
+            
+            return value
+            
+        except Exception as e:
+            logger.warning(f"[SummaryService] 获取summary_max_chars失败: {e}，使用默认值{default_chars}")
+            return default_chars
+    
     def _get_replyer_model(self):
         """懒加载获取回复模型"""
         if self._replyer_model_checked:
@@ -273,9 +311,12 @@ class SummaryService:
                     text_content = text_content[:max_text_len] + "..."
                 text_block = f"\n\n视频字幕/语音内容:\n{text_content}"
             
+            # 获取总结字数配置
+            summary_max_chars = self._get_summary_max_chars()
+            
             # 构建提示词
             final_prompt = (
-                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（80-120字）。\n"
+                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字以内）。\n"
                 f"要求：\n"
                 f"1. 只描述视频的客观内容，不要加入主观评价或感受\n"
                 f"2. 不要使用'你'、'我'等人称代词\n"
@@ -368,9 +409,12 @@ class SummaryService:
             if not text_content and not description:
                 logger.warning("[SummaryService] 无字幕和简介，仅基于标题生成总结")
             
+            # 获取总结字数配置
+            summary_max_chars = self._get_summary_max_chars()
+            
             # 构建提示词
             final_prompt = (
-                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（80-120字）。\n"
+                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字以内）。\n"
                 f"注意：由于视频时长较长，未进行视觉分析，请主要基于字幕/语音内容和视频简介进行总结。\n"
                 f"要求：\n"
                 f"1. 只描述视频的客观内容，不要加入主观评价或感受\n"
@@ -492,9 +536,12 @@ class SummaryService:
                     text_content = text_content[:max_text_len] + "..."
                 text_block = f"\n\n视频字幕/语音内容:\n{text_content}"
             
+            # 获取总结字数配置
+            summary_max_chars = self._get_summary_max_chars()
+            
             # 构建最终提示词（客观视角）
             final_prompt = (
-                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（80-120字）。\n"
+                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字以内）。\n"
                 f"要求：\n"
                 f"1. 只描述视频的客观内容，不要加入主观评价或感受\n"
                 f"2. 不要使用'你'、'我'等人称代词\n"

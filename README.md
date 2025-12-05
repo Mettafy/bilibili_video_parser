@@ -73,6 +73,8 @@
 
 ## 使用方法
 
+> ⚠️ **注意**：目前仅支持 B站视频链接，**不支持** QQ 中分享的 B站小程序卡片。如需解析视频，请复制视频链接发送。
+
 ### 自动检测模式
 
 直接发送 B站视频链接、AV号或BV号，麦麦会自动识别并解析：
@@ -104,7 +106,7 @@ BV1xx411c7XZ
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `config_version` | string | `"3.0.0"` | 配置文件版本号，请勿手动修改 |
+| `config_version` | string | `"3.1.0"` | 配置文件版本号，请勿手动修改 |
 | `enabled` | bool | `true` | 是否启用插件 |
 
 ### [trigger] 触发方式配置
@@ -114,18 +116,25 @@ BV1xx411c7XZ
 | `auto_detect_enabled` | bool | `true` | 是否自动检测B站链接。开启后，用户发送B站链接时会自动触发解析 |
 | `command_enabled` | bool | `true` | 是否启用 `/bili` 命令触发 |
 
-### [video] 全局视频配置
+### [summary] 总结生成配置
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `max_duration_min` | float | `60.0` | 视频最大时长（分钟）。超过此时长的视频将被跳过不处理。例如设置为60，则60分59秒的视频仍可处理，61分钟的视频会被跳过 |
+| `enable_summary` | bool | `true` | 是否生成最终总结。开启时会调用模型生成总结；关闭时直接将原生视频信息发送给回复系统 |
+| `summary_max_chars` | int | `200` | 总结最大字数。范围：60-6000，小数会自动取整，超出范围使用默认值200 |
+
+### [video] 视频处理配置
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `max_duration_min` | float | `60.0` | 视频最大时长（分钟）。超过此时长的视频将被跳过不处理 |
 | `max_size_mb` | int | `300` | 视频最大文件大小（MB）。超过此大小的视频将被跳过 |
-| `enable_asr` | bool | `false` | 是否启用ASR语音识别。开启后会从视频音轨中提取语音进行识别，作为字幕的补充。需要MaiBot配置voice模型 |
-| `sessdata` | string | `""` | B站SESSDATA Cookie。用于获取视频字幕，不填写时将跳过字幕获取。获取方法见下文。<br />**使用此功能获取视频字幕，可能会导致账号被b站风控，请使用小号。** |
-| `temp_file_max_age_min` | int | `60` | 临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除；设为>0表示定时清理超过指定时间的临时文件 |
-| `retry_max_attempts` | int | `3` | 网络请求最大重试次数（针对可重试的错误如网络超时、服务器错误等） |
+| `sessdata` | string | `""` | B站SESSDATA Cookie。用于获取视频字幕，不填写时将跳过字幕获取。<br />**使用此功能可能会导致账号被b站风控，请使用小号。** |
+| `enable_asr` | bool | `false` | 是否启用ASR语音识别。开启后会从视频音轨中提取语音进行识别，作为字幕的补充 |
+| `cache_enabled` | bool | `true` | 是否启用视频解析结果缓存。开启后，相同视频不会重复解析 |
+| `temp_file_max_age_min` | int | `60` | 临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除 |
+| `retry_max_attempts` | int | `3` | 网络请求最大重试次数 |
 | `retry_interval_sec` | float | `2.0` | 网络请求重试间隔（秒） |
-| `cache_enabled` | bool | `true` | 是否启用视频解析结果缓存。开启后，相同视频不会重复解析，直接使用缓存的结果 |
 
 **如何获取 SESSDATA：**使用此功能获取视频字幕，可能会导致账号被b站风控，请使用小号。
 
@@ -141,7 +150,6 @@ BV1xx411c7XZ
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `visual_method` | string | `"default"` | 视觉分析方式，可选值见下表 |
-| `enable_summary` | bool | `true` | 是否生成最终总结（仅影响自动检测模式）。开启时会调用主回复模型生成80-120字的总结；关闭时直接将原生视频信息发送给主回复系统 |
 
 **visual_method 可选值：**
 
@@ -212,6 +220,10 @@ enabled = true
 auto_detect_enabled = true
 command_enabled = true
 
+[summary]
+enable_summary = true
+summary_max_chars = 200
+
 [video]
 sessdata = "你的SESSDATA"
 
@@ -224,6 +236,10 @@ visual_method = "default"
 ```toml
 [plugin]
 enabled = true
+
+[summary]
+enable_summary = true
+summary_max_chars = 200
 
 [video]
 sessdata = "你的SESSDATA"
@@ -244,6 +260,10 @@ model = "Qwen/Qwen2.5-VL-72B-Instruct"
 [plugin]
 enabled = true
 
+[summary]
+enable_summary = true
+summary_max_chars = 200
+
 [video]
 sessdata = "你的SESSDATA"
 
@@ -252,7 +272,7 @@ visual_method = "doubao"
 
 [analysis.doubao]
 api_key = "你的豆包API密钥"
-model_id = "doubao-seed-1-6-251015"
+model_id = "doubao-seed-1-6-flash-250828"
 ```
 
 ---

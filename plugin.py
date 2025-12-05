@@ -74,7 +74,8 @@ class BilibiliVideoParserPlugin(BasePlugin):
     config_section_descriptions = {
         "plugin": "插件基本信息",
         "trigger": "触发方式配置",
-        "video": "全局视频配置（包含缓存设置）",
+        "summary": "总结生成配置",
+        "video": "视频处理配置",
         "analysis": "视觉分析配置",
         "analysis.default": "Default模式配置（使用MaiBot VLM）",
         "analysis.builtin": "Builtin模式配置（使用插件内置VLM，支持动态参数传递）",
@@ -86,7 +87,7 @@ class BilibiliVideoParserPlugin(BasePlugin):
         "plugin": {
             "config_version": ConfigField(
                 type=str,
-                default="3.0.0",
+                default="3.1.0",
                 description="配置文件版本"
             ),
             "enabled": ConfigField(
@@ -107,6 +108,18 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 description="是否启用命令触发（/bili 命令）"
             ),
         },
+        "summary": {
+            "enable_summary": ConfigField(
+                type=bool,
+                default=True,
+                description="是否生成最终总结。开启时会调用模型生成总结；关闭时直接将原生视频信息发送给回复系统"
+            ),
+            "summary_max_chars": ConfigField(
+                type=int,
+                default=200,
+                description="总结最大字数。范围60-6000，小数会自动取整，超出范围使用默认值200"
+            ),
+        },
         "video": {
             "max_duration_min": ConfigField(
                 type=float,
@@ -118,35 +131,35 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=300,
                 description="视频最大文件大小(MB)，超过此大小的视频将被跳过"
             ),
-            "enable_asr": ConfigField(
-                type=bool,
-                default=False,
-                description="是否启用ASR语音识别（可选，需要下载视频）。开启后会从视频音轨中提取语音进行识别，作为字幕的补充"
-            ),
             "sessdata": ConfigField(
                 type=str,
                 default="",
-                description="B站SESSDATA Cookie（可选，用于获取字幕）。不填写时将跳过字幕获取，仅使用视频标题、简介和帧分析生成总结"
+                description="B站SESSDATA Cookie（可选，用于获取字幕）。不填写时将跳过字幕获取"
+            ),
+            "enable_asr": ConfigField(
+                type=bool,
+                default=False,
+                description="是否启用ASR语音识别（可选）。开启后会从视频音轨中提取语音进行识别，作为字幕的补充"
+            ),
+            "cache_enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="是否启用视频解析结果缓存。开启后，相同视频不会重复解析"
             ),
             "temp_file_max_age_min": ConfigField(
                 type=int,
                 default=60,
-                description="临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除；设为>0表示定时清理超过指定时间的临时文件"
+                description="临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除"
             ),
             "retry_max_attempts": ConfigField(
                 type=int,
                 default=3,
-                description="网络请求最大重试次数（针对可重试的错误如网络超时、服务器错误等）"
+                description="网络请求最大重试次数"
             ),
             "retry_interval_sec": ConfigField(
                 type=float,
                 default=2.0,
                 description="网络请求重试间隔（秒）"
-            ),
-            "cache_enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用视频解析结果缓存。开启后，相同视频不会重复解析，直接使用缓存的结果"
             ),
         },
         "analysis": {
@@ -154,11 +167,6 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 type=str,
                 default="default",
                 description="视觉分析方式：default（使用MaiBot主程序的VLM）、builtin（使用插件内置VLM）、doubao（使用豆包视频模型）或 none（不进行视觉分析）"
-            ),
-            "enable_summary": ConfigField(
-                type=bool,
-                default=True,
-                description="是否生成最终总结（仅影响自动检测模式）。开启时会调用模型生成80-120字的总结；关闭时直接将原生视频信息（标题、简介、字幕、帧描述等）发送给主回复系统"
             ),
         },
         "analysis.default": {
