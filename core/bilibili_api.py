@@ -233,6 +233,8 @@ class BilibiliAPI:
         if sessdata:
             headers['Cookie'] = f'SESSDATA={sessdata}'
         
+        logger.debug(f"[BilibiliAPI] 获取视频信息: {video_id}, 分P: {page}")
+        
         async def _fetch():
             try:
                 async with aiohttp.ClientSession() as session:
@@ -344,6 +346,8 @@ class BilibiliAPI:
         
         if sessdata:
             headers['Cookie'] = f'SESSDATA={sessdata}'
+        
+        logger.debug(f"[BilibiliAPI] 获取字幕: aid={aid}, cid={cid}")
         
         async def _fetch():
             try:
@@ -517,6 +521,8 @@ class BilibiliAPI:
         if sessdata:
             headers['Cookie'] = f'SESSDATA={sessdata}'
         
+        logger.debug(f"[BilibiliAPI] 获取下载地址: aid={aid}, cid={cid}")
+        
         async def _fetch():
             try:
                 async with aiohttp.ClientSession() as session:
@@ -611,6 +617,8 @@ class BilibiliAPI:
             'Referer': 'https://www.bilibili.com/'
         }
         
+        logger.debug(f"[BilibiliAPI] 开始下载视频到: {tmp_path}")
+        
         async def _download():
             try:
                 async with aiohttp.ClientSession() as session:
@@ -650,6 +658,7 @@ class BilibiliAPI:
                                     )
                                 f.write(chunk)
                         
+                        logger.debug(f"[BilibiliAPI] 视频下载完成: {total_downloaded / 1024 / 1024:.2f}MB")
                         return tmp_path
                         
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:

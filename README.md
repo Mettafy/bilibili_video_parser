@@ -21,6 +21,8 @@
 
 在使用本插件前，请**务必注意**以下几点：
 
+0.  配置文件有多久清理临时视频文件选项，但是请设置的长一点，然后==手动清理插件目录下的data/temp==，或者你可以相信ai写出来的代码。
+
 1. **必须安装插件依赖**：本插件需要额外的 Python 依赖包，请参考下方"安装插件"章节。
 2. **ASR功能配置**：如需使用 ASR 功能（语音转文字），必须在 MaiBot 配置文件 `model_config.toml` 中配置 `[model_task_config.voice]` 语音识别模型，否则 ASR 功能无法正常运行。
 3. **FFmpeg 功能说明**：FFmpeg 是本插件的核心依赖，负责以下功能：
@@ -116,13 +118,14 @@ BV1xx411c7XZ
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `max_duration_min` | float | `30.0` | 视频最大时长（分钟）。超过此时长的视频将被跳过不处理。例如设置为30，则30分59秒的视频仍可处理，31分钟的视频会被跳过 |
-| `max_size_mb` | int | `200` | 视频最大文件大小（MB）。超过此大小的视频将被跳过 |
+| `max_duration_min` | float | `60.0` | 视频最大时长（分钟）。超过此时长的视频将被跳过不处理。例如设置为60，则60分59秒的视频仍可处理，61分钟的视频会被跳过 |
+| `max_size_mb` | int | `300` | 视频最大文件大小（MB）。超过此大小的视频将被跳过 |
 | `enable_asr` | bool | `false` | 是否启用ASR语音识别。开启后会从视频音轨中提取语音进行识别，作为字幕的补充。需要MaiBot配置voice模型 |
 | `sessdata` | string | `""` | B站SESSDATA Cookie。用于获取视频字幕，不填写时将跳过字幕获取。获取方法见下文。<br />**使用此功能获取视频字幕，可能会导致账号被b站风控，请使用小号。** |
 | `temp_file_max_age_min` | int | `60` | 临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除；设为>0表示定时清理超过指定时间的临时文件 |
 | `retry_max_attempts` | int | `3` | 网络请求最大重试次数（针对可重试的错误如网络超时、服务器错误等） |
 | `retry_interval_sec` | float | `2.0` | 网络请求重试间隔（秒） |
+| `cache_enabled` | bool | `true` | 是否启用视频解析结果缓存。开启后，相同视频不会重复解析，直接使用缓存的结果 |
 
 **如何获取 SESSDATA：**使用此功能获取视频字幕，可能会导致账号被b站风控，请使用小号。
 
@@ -156,38 +159,36 @@ BV1xx411c7XZ
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟）。超过此时长的视频将只使用字幕+ASR，不进行视觉分析（节省API费用） |
-| `max_frames` | int | `10` | 最大分析帧数。视频会被等距抽取这么多帧进行分析 |
-| `frame_interval_sec` | int | `6` | 抽帧间隔（秒）。每隔多少秒抽取一帧，实际帧数受 max_frames 限制 |
+| `frame_interval_sec` | int | `10` | 抽帧间隔（秒）。每隔多少秒抽取一帧，系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧，最多分析5帧） |
 
 ### [analysis.builtin] Builtin模式配置
 
-使用插件内置 VLM 时的配置。需要自行配置 API。
+使用插件内置 VLM 时的配置。需要自行配置 API。支持动态参数传递，可根据不同API服务商添加自定义参数。
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟） |
-| `max_frames` | int | `10` | 最大分析帧数 |
-| `frame_interval_sec` | int | `6` | 抽帧间隔（秒） |
+| `frame_interval_sec` | int | `10` | 抽帧间隔（秒），系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧，最多分析5帧） |
 | `client_type` | string | `"openai"` | API服务类型：`openai`（兼容OpenAI格式的API）或 `gemini`（Google Gemini格式） |
 | `base_url` | string | `"https://api.siliconflow.cn/v1"` | API基础URL |
 | `api_key` | string | `""` | API密钥 |
 | `model` | string | `"Qwen/Qwen2.5-VL-72B-Instruct"` | 模型标识符（API服务商提供的模型ID） |
-| `temperature` | float | `0.3` | 模型温度（0-1），值越低输出越确定 |
-| `max_tokens` | int | `512` | 最大输出token数 |
 | `timeout` | int | `60` | 请求超时时间（秒） |
 | `max_retries` | int | `2` | 最大重试次数 |
 | `retry_interval` | int | `5` | 重试间隔时间（秒） |
 | `frame_prompt` | string | `""` | 自定义帧分析提示词，留空使用默认提示词 |
 
+**动态参数说明**：builtin模式支持动态参数传递，您可以根据API服务商的要求添加额外参数，如 `temperature`、`max_tokens`、`top_p` 等。只有您在配置文件中实际定义的参数才会被传递给API。
+
 ### [analysis.doubao] Doubao模式配置
 
-使用豆包视频理解模型时的配置。
+使用豆包视频理解模型时的配置。支持动态参数传递。
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟） |
 | `api_key` | string | `""` | 豆包API密钥，也可通过环境变量 `ARK_API_KEY` 设置 |
-| `model_id` | string | `"doubao-seed-1-6-251015"` | 豆包模型ID |
+| `model_id` | string | `"doubao-seed-1-6-flash-250828"` | 豆包模型ID |
 | `fps` | float | `1.0` | 抽帧频率（0.2-5），值越高理解越精细但token消耗越大 |
 | `base_url` | string | `"https://ark.cn-beijing.volces.com/api/v3"` | 豆包API基础URL |
 | `timeout` | int | `120` | 请求超时时间（秒） |
@@ -195,11 +196,7 @@ BV1xx411c7XZ
 | `retry_interval` | int | `10` | 重试间隔时间（秒） |
 | `video_prompt` | string | `""` | 自定义视频分析提示词，留空使用默认提示词 |
 
-### [cache] 缓存配置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enabled` | bool | `true` | 是否启用缓存。开启后，已解析的视频总结会被缓存，避免重复处理 |
+**动态参数说明**：doubao模式同样支持动态参数传递，您可以添加豆包API支持的额外参数。
 
 ---
 

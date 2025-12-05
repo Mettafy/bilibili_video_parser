@@ -74,12 +74,11 @@ class BilibiliVideoParserPlugin(BasePlugin):
     config_section_descriptions = {
         "plugin": "插件基本信息",
         "trigger": "触发方式配置",
-        "video": "全局视频配置",
+        "video": "全局视频配置（包含缓存设置）",
         "analysis": "视觉分析配置",
         "analysis.default": "Default模式配置（使用MaiBot VLM）",
-        "analysis.builtin": "Builtin模式配置（使用插件内置VLM）",
-        "analysis.doubao": "Doubao模式配置（使用豆包视频模型）",
-        "cache": "缓存配置",
+        "analysis.builtin": "Builtin模式配置（使用插件内置VLM，支持动态参数传递）",
+        "analysis.doubao": "Doubao模式配置（使用豆包视频模型，支持动态参数传递）",
     }
 
     # 配置Schema定义
@@ -111,12 +110,12 @@ class BilibiliVideoParserPlugin(BasePlugin):
         "video": {
             "max_duration_min": ConfigField(
                 type=float,
-                default=30.0,
+                default=60.0,
                 description="视频最大时长(分钟)，超过此时长的视频将被跳过不处理"
             ),
             "max_size_mb": ConfigField(
                 type=int,
-                default=200,
+                default=300,
                 description="视频最大文件大小(MB)，超过此大小的视频将被跳过"
             ),
             "enable_asr": ConfigField(
@@ -144,6 +143,11 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=2.0,
                 description="网络请求重试间隔（秒）"
             ),
+            "cache_enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="是否启用视频解析结果缓存。开启后，相同视频不会重复解析，直接使用缓存的结果"
+            ),
         },
         "analysis": {
             "visual_method": ConfigField(
@@ -163,15 +167,10 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=10.0,
                 description="进行视觉分析的最大视频时长(分钟)。超过此时长的视频将只使用字幕+ASR+视频信息，不进行视觉分析"
             ),
-            "max_frames": ConfigField(
-                type=int,
-                default=10,
-                description="最大分析帧数"
-            ),
             "frame_interval_sec": ConfigField(
                 type=int,
-                default=6,
-                description="抽帧间隔(秒)，每隔多少秒抽取一帧"
+                default=10,
+                description="抽帧间隔(秒)，每隔多少秒抽取一帧。系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧）"
             ),
         },
         "analysis.builtin": {
@@ -180,15 +179,10 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=10.0,
                 description="进行视觉分析的最大视频时长(分钟)。超过此时长的视频将只使用字幕+ASR+视频信息，不进行视觉分析"
             ),
-            "max_frames": ConfigField(
-                type=int,
-                default=10,
-                description="最大分析帧数"
-            ),
             "frame_interval_sec": ConfigField(
                 type=int,
-                default=6,
-                description="抽帧间隔(秒)，每隔多少秒抽取一帧"
+                default=10,
+                description="抽帧间隔(秒)，每隔多少秒抽取一帧。系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧）"
             ),
             "client_type": ConfigField(
                 type=str,
@@ -209,16 +203,6 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 type=str,
                 default="Qwen/Qwen2.5-VL-72B-Instruct",
                 description="模型标识符（API服务商提供的模型ID）"
-            ),
-            "temperature": ConfigField(
-                type=float,
-                default=0.3,
-                description="模型温度（0-1，值越低输出越确定）"
-            ),
-            "max_tokens": ConfigField(
-                type=int,
-                default=512,
-                description="最大输出token数"
             ),
             "timeout": ConfigField(
                 type=int,
@@ -254,7 +238,7 @@ class BilibiliVideoParserPlugin(BasePlugin):
             ),
             "model_id": ConfigField(
                 type=str,
-                default="doubao-seed-1-6-251015",
+                default="doubao-seed-1-6-flash-250828",
                 description="豆包模型ID"
             ),
             "fps": ConfigField(
@@ -288,21 +272,14 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 description="自定义视频分析提示词（留空使用默认提示词）"
             ),
         },
-        "cache": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用缓存"
-            ),
-        },
     }
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, plugin_dir: str, **kwargs):
+        super().__init__(plugin_dir, **kwargs)
         
         # 初始化管理器实例（在__init__中初始化，确保get_plugin_components可以使用）
-        plugin_dir = Path(__file__).parent
-        data_dir = plugin_dir / "data"
+        plugin_path = Path(__file__).parent
+        data_dir = plugin_path / "data"
         
         # 初始化目录结构
         # data/
@@ -333,10 +310,19 @@ class BilibiliVideoParserPlugin(BasePlugin):
         # 定时清理任务句柄
         self._cleanup_task: Optional[asyncio.Task] = None
         
+        # 启动定时清理任务（延迟启动，确保插件完全初始化）
+        asyncio.create_task(self._start_cleanup_task_after_delay())
+        
         logger.info("[BilibiliVideoParser] 插件初始化完成")
     
     def _get_vlm_config(self) -> dict:
-        """获取VLM配置（根据visual_method决定使用哪个配置）"""
+        """获取VLM配置（根据visual_method决定使用哪个配置）
+        
+        对于builtin模式，采用动态参数传递策略：
+        - 只传递用户在配置文件中实际定义的参数
+        - 不同API服务商可能支持不同的参数
+        - 用户可以自由添加服务商特有的参数
+        """
         visual_method = self.get_config("analysis.visual_method", "default")
         
         # 基础配置
@@ -346,30 +332,54 @@ class BilibiliVideoParserPlugin(BasePlugin):
         
         if visual_method == "builtin":
             # 使用插件内置VLM配置
-            config.update({
-                "use_builtin": True,
-                "client_type": self.get_config("analysis.builtin.client_type", "openai"),
-                "base_url": self.get_config("analysis.builtin.base_url", "https://api.siliconflow.cn/v1"),
-                "api_key": self.get_config("analysis.builtin.api_key", ""),
-                "model": self.get_config("analysis.builtin.model", "Qwen/Qwen2.5-VL-72B-Instruct"),
-                "temperature": self.get_config("analysis.builtin.temperature", 0.3),
-                "max_tokens": self.get_config("analysis.builtin.max_tokens", 512),
-                "timeout": self.get_config("analysis.builtin.timeout", 60),
-                "max_retries": self.get_config("analysis.builtin.max_retries", 2),
-                "retry_interval": self.get_config("analysis.builtin.retry_interval", 5),
-                "frame_prompt": self.get_config("analysis.builtin.frame_prompt", ""),
-            })
+            # 动态获取所有builtin配置项，让用户自由定义参数
+            config["use_builtin"] = True
+            
+            # 必需参数（有默认值）
+            config["client_type"] = self.get_config("analysis.builtin.client_type", "openai")
+            config["base_url"] = self.get_config("analysis.builtin.base_url", "https://api.siliconflow.cn/v1")
+            config["api_key"] = self.get_config("analysis.builtin.api_key", "")
+            config["model"] = self.get_config("analysis.builtin.model", "Qwen/Qwen2.5-VL-72B-Instruct")
+            config["timeout"] = self.get_config("analysis.builtin.timeout", 60)
+            config["max_retries"] = self.get_config("analysis.builtin.max_retries", 2)
+            config["retry_interval"] = self.get_config("analysis.builtin.retry_interval", 5)
+            config["frame_prompt"] = self.get_config("analysis.builtin.frame_prompt", "")
+            
+            # 动态参数：只有用户配置了才传递
+            # 这些参数不同服务商可能不支持，所以不设默认值
+            optional_params = ["temperature", "max_tokens", "top_p", "top_k", "presence_penalty", "frequency_penalty"]
+            for param in optional_params:
+                value = self.get_config(f"analysis.builtin.{param}", None)
+                if value is not None:
+                    config[param] = value
+            
+            # 获取所有用户自定义的额外参数（服务商特有参数）
+            # 通过遍历配置获取所有analysis.builtin.*的配置项
+            builtin_config = self.get_config("analysis.builtin", {})
+            if isinstance(builtin_config, dict):
+                known_params = {
+                    "visual_max_duration_min", "frame_interval_sec", "client_type",
+                    "base_url", "api_key", "model", "timeout", "max_retries",
+                    "retry_interval", "frame_prompt"
+                } | set(optional_params)
+                
+                for key, value in builtin_config.items():
+                    if key not in known_params and value is not None:
+                        # 用户自定义的额外参数，直接传递
+                        config[key] = value
         else:
             # 使用MaiBot VLM（default模式）或不使用VLM（doubao/none模式）
-            config.update({
-                "use_builtin": False,
-            })
+            config["use_builtin"] = False
         
         return config
 
-    async def async_init(self):
-        """异步初始化 - 启动定时清理任务"""
-        await super().async_init()
+    async def _start_cleanup_task_after_delay(self):
+        """延迟启动定时清理任务
+        
+        在插件初始化完成后，延迟10秒再启动定时任务，确保插件完全初始化
+        后再开始定时任务，避免初始化过程中的竞争条件。
+        """
+        await asyncio.sleep(10)
         
         # 获取临时文件最大保留时间配置
         max_age_min = self.get_config("video.temp_file_max_age_min", 60)
@@ -380,19 +390,30 @@ class BilibiliVideoParserPlugin(BasePlugin):
             
             # 启动定时清理任务
             self._cleanup_task = asyncio.create_task(self._periodic_cleanup_task(max_age_min))
-            logger.info(f"[BilibiliVideoParser] 定时清理任务已启动（间隔30分钟，保留{max_age_min}分钟内的临时文件）")
+            
+            # 动态计算清理间隔：最小5分钟，最大30分钟
+            cleanup_interval_min = max(5, min(30, max_age_min))
+            logger.info(f"[BilibiliVideoParser] 定时清理任务已启动（间隔{cleanup_interval_min}分钟，保留{max_age_min}分钟内的临时文件）")
         else:
             logger.info("[BilibiliVideoParser] 临时文件即时删除模式已启用")
     
     async def _periodic_cleanup_task(self, max_age_min: int):
         """定时清理任务
         
-        每30分钟执行一次清理，删除超过 max_age_min 分钟的临时文件
+        清理间隔动态调整：
+        - 最小5分钟，最大30分钟
+        - 默认等于 max_age_min
+        
+        Args:
+            max_age_min: 文件最大保留时间（分钟）
         """
+        # 动态计算清理间隔：最小5分钟，最大30分钟
+        cleanup_interval_min = max(5, min(30, max_age_min))
+        
         while True:
             try:
-                # 等待30分钟
-                await asyncio.sleep(30 * 60)
+                # 等待清理间隔
+                await asyncio.sleep(cleanup_interval_min * 60)
                 
                 # 执行清理（cleanup_old_temp_files内部会记录info日志）
                 cleanup_old_temp_files(max_age_min)
@@ -403,19 +424,6 @@ class BilibiliVideoParserPlugin(BasePlugin):
             except Exception as e:
                 logger.error(f"[BilibiliVideoParser] 定时清理任务异常: {e}")
                 # 继续运行，不因异常退出
-    
-    async def async_destroy(self):
-        """异步销毁 - 停止定时清理任务"""
-        # 取消定时清理任务
-        if self._cleanup_task and not self._cleanup_task.done():
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-            logger.info("[BilibiliVideoParser] 定时清理任务已停止")
-        
-        await super().async_destroy()
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         """获取插件组件列表"""

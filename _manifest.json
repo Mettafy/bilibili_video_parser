@@ -8,6 +8,21 @@
     "url": "https://github.com/Mettafy"
   },
   "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "bilibili",
+    "B站",
+    "视频解析",
+    "视频总结",
+    "AI总结",
+    "VLM",
+    "字幕",
+    "ASR"
+  ],
+  "categories": [
+    "media",
+    "ai",
+    "utility"
+  ],
   "host_application": {
     "min_version": "0.11.0"
   },

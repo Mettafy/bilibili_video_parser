@@ -73,7 +73,13 @@ class BuiltinVLMClient:
     支持OpenAI和Gemini两种API格式
     """
     
-    DEFAULT_FRAME_PROMPT = "请描述这张图片的内容，包括场景、人物、动作、文字等关键信息。"
+    DEFAULT_FRAME_PROMPT = """请用中文描述这张视频截图的内容：
+1. 场景环境（时间、地点、背景）
+2. 人物/角色（外观、服装、动作）- 如是已知作品角色请指出名称和作品
+3. 画面中的文字（字幕、对话框、界面文本等）
+4. 正在发生的事件或动作
+
+输出为一段连贯的描述文本。"""
     
     def __init__(self, config: Dict[str, Any]):
         """初始化VLM客户端
@@ -188,13 +194,18 @@ class BuiltinVLMClient:
             return await self._analyze_with_openai(image_path, prompt)
     
     async def _analyze_with_openai(self, image_path: str, prompt: str) -> Optional[str]:
-        """使用OpenAI兼容API分析图片"""
+        """使用OpenAI兼容API分析图片
+        
+        采用动态参数传递策略：
+        - 只传递用户在配置中实际定义的参数
+        - 不同API服务商可能支持不同的参数
+        - 用户可以自由添加服务商特有的参数
+        """
         if not self._openai_client:
             return None
             
+        # 必需参数
         model = self.config.get("model", "gpt-4-vision-preview")
-        temperature = self.config.get("temperature", 0.3)
-        max_tokens = self.config.get("max_tokens", 512)
         timeout = self.config.get("timeout", 60)
         max_retries = self.config.get("max_retries", 2)
         retry_interval = self.config.get("retry_interval", 5)
@@ -206,31 +217,60 @@ class BuiltinVLMClient:
             
         mime_type = self._get_image_mime_type(image_path)
         
+        # 构建动态API参数
+        # 只传递用户配置的参数，不传递未配置的参数
+        api_params = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+        }
+        
+        # 动态添加可选参数（只有用户配置了才传递）
+        # 这些参数不同服务商可能不支持
+        optional_params = [
+            "temperature", "max_tokens", "top_p", "top_k",
+            "presence_penalty", "frequency_penalty", "stop",
+            "seed", "logprobs", "top_logprobs", "n"
+        ]
+        
+        # 已知的非API参数（不应传递给API）
+        non_api_params = {
+            "client_type", "base_url", "api_key", "model", "timeout",
+            "max_retries", "retry_interval", "frame_prompt", "use_builtin",
+            "visual_method", "visual_max_duration_min", "frame_interval_sec"
+        }
+        
+        for param in optional_params:
+            if param in self.config and self.config[param] is not None:
+                api_params[param] = self.config[param]
+        
+        # 添加用户自定义的额外参数（服务商特有参数）
+        for key, value in self.config.items():
+            if key not in non_api_params and key not in optional_params and key not in api_params:
+                if value is not None:
+                    api_params[key] = value
+        
+        logger.debug(f"[BuiltinVLM] API参数: {list(api_params.keys())}")
+        
         for attempt in range(max_retries + 1):
             try:
                 response = await asyncio.wait_for(
-                    self._openai_client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": prompt
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:{mime_type};base64,{image_base64}"
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
-                        temperature=temperature,
-                        max_tokens=max_tokens
-                    ),
+                    self._openai_client.chat.completions.create(**api_params),
                     timeout=timeout
                 )
                 
@@ -251,13 +291,17 @@ class BuiltinVLMClient:
         return None
     
     async def _analyze_with_gemini(self, image_path: str, prompt: str) -> Optional[str]:
-        """使用Gemini API分析图片"""
+        """使用Gemini API分析图片
+        
+        采用动态参数传递策略：
+        - 只传递用户在配置中实际定义的参数
+        - Gemini API有自己特有的参数格式
+        """
         if not self._gemini_client:
             return None
             
+        # 必需参数
         model = self.config.get("model", "gemini-1.5-flash")
-        temperature = self.config.get("temperature", 0.3)
-        max_tokens = self.config.get("max_tokens", 512)
         timeout = self.config.get("timeout", 60)
         max_retries = self.config.get("max_retries", 2)
         retry_interval = self.config.get("retry_interval", 5)
@@ -271,21 +315,64 @@ class BuiltinVLMClient:
                 # 创建模型
                 gemini_model = self._gemini_client.GenerativeModel(model)
                 
-                # 生成配置
-                generation_config = self._gemini_client.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens
-                )
+                # 构建动态生成配置
+                # 只传递用户配置的参数
+                generation_config_params = {}
+                
+                # Gemini支持的生成参数映射
+                gemini_param_mapping = {
+                    "temperature": "temperature",
+                    "max_tokens": "max_output_tokens",  # Gemini使用不同的参数名
+                    "top_p": "top_p",
+                    "top_k": "top_k",
+                    "stop": "stop_sequences",  # Gemini使用不同的参数名
+                }
+                
+                for config_key, gemini_key in gemini_param_mapping.items():
+                    if config_key in self.config and self.config[config_key] is not None:
+                        generation_config_params[gemini_key] = self.config[config_key]
+                
+                # 添加用户自定义的Gemini特有参数
+                # 已知的非生成配置参数
+                non_generation_params = {
+                    "client_type", "base_url", "api_key", "model", "timeout",
+                    "max_retries", "retry_interval", "frame_prompt", "use_builtin",
+                    "visual_method", "visual_max_duration_min", "frame_interval_sec",
+                    "temperature", "max_tokens", "top_p", "top_k", "stop"
+                }
+                
+                for key, value in self.config.items():
+                    if key not in non_generation_params and value is not None:
+                        # 用户自定义的额外参数，直接传递给generation_config
+                        generation_config_params[key] = value
+                
+                logger.debug(f"[BuiltinVLM] Gemini生成配置参数: {list(generation_config_params.keys())}")
+                
+                # 创建生成配置（如果有参数的话）
+                generation_config = None
+                if generation_config_params:
+                    generation_config = self._gemini_client.types.GenerationConfig(
+                        **generation_config_params
+                    )
                 
                 # 异步调用
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        gemini_model.generate_content,
-                        [prompt, image],
-                        generation_config=generation_config
-                    ),
-                    timeout=timeout
-                )
+                if generation_config:
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            gemini_model.generate_content,
+                            [prompt, image],
+                            generation_config=generation_config
+                        ),
+                        timeout=timeout
+                    )
+                else:
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            gemini_model.generate_content,
+                            [prompt, image]
+                        ),
+                        timeout=timeout
+                    )
                 
                 if response and response.text:
                     return response.text

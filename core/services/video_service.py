@@ -188,7 +188,13 @@ class VideoService:
         self._doubao_checked = False
     
     def _get_doubao_analyzer(self):
-        """懒加载获取豆包分析器"""
+        """懒加载获取豆包分析器
+        
+        采用动态参数传递策略：
+        - 只传递用户在配置中实际定义的参数
+        - 不同版本的豆包API可能支持不同的参数
+        - 用户可以自由添加豆包特有的参数
+        """
         if self._doubao_checked:
             return self._doubao_analyzer
         
@@ -201,17 +207,40 @@ class VideoService:
         try:
             from ..doubao_analyzer import DoubaoAnalyzer
             
-            # 使用新的嵌套配置路径 analysis.doubao.*
+            # 必需参数（有默认值）
             doubao_config = {
                 "api_key": self.get_config("analysis.doubao.api_key", ""),
                 "model_id": self.get_config("analysis.doubao.model_id", "doubao-seed-1-6-251015"),
-                "fps": self.get_config("analysis.doubao.fps", 1.0),
                 "base_url": self.get_config("analysis.doubao.base_url", "https://ark.cn-beijing.volces.com/api/v3"),
                 "timeout": self.get_config("analysis.doubao.timeout", 120),
                 "max_retries": self.get_config("analysis.doubao.max_retries", 2),
                 "retry_interval": self.get_config("analysis.doubao.retry_interval", 10),
                 "video_prompt": self.get_config("analysis.doubao.video_prompt", ""),
             }
+            
+            # 动态参数：只有用户配置了才传递
+            # 这些参数不同版本的豆包API可能不支持
+            optional_params = ["fps", "temperature", "max_tokens", "top_p", "top_k"]
+            for param in optional_params:
+                value = self.get_config(f"analysis.doubao.{param}", None)
+                if value is not None:
+                    doubao_config[param] = value
+            
+            # 获取所有用户自定义的额外参数（豆包特有参数）
+            # 通过遍历配置获取所有analysis.doubao.*的配置项
+            doubao_section = self.get_config("analysis.doubao", {})
+            if isinstance(doubao_section, dict):
+                known_params = {
+                    "visual_max_duration_min", "api_key", "model_id", "base_url",
+                    "timeout", "max_retries", "retry_interval", "video_prompt"
+                } | set(optional_params)
+                
+                for key, value in doubao_section.items():
+                    if key not in known_params and value is not None:
+                        # 用户自定义的额外参数，直接传递
+                        doubao_config[key] = value
+            
+            logger.debug(f"[VideoService] 豆包配置参数: {list(doubao_config.keys())}")
             
             self._doubao_analyzer = DoubaoAnalyzer(doubao_config)
             logger.info("[BilibiliVideoParser] 豆包视频分析器已初始化")
@@ -263,6 +292,8 @@ class VideoService:
         result = VideoProcessResult(video_id=video_id)
         
         try:
+            logger.debug(f"[VideoService] 开始处理视频: {video_id}, 分P: {page}")
+            
             # 获取全局配置（从 video 节）
             sessdata = self.get_config("video.sessdata", "")
             enable_asr = self.get_config("video.enable_asr", False)
@@ -275,24 +306,24 @@ class VideoService:
             # 视觉分析方式
             visual_method = self.get_config("analysis.visual_method", "default")
             
+            # 硬编码最大抽帧数和最大分析帧数
+            MAX_EXTRACT_FRAMES = 10  # 最大抽帧数
+            MAX_ANALYZE_FRAMES = 5   # 最大VLM分析帧数（在handlers.py中使用）
+            
             # 根据 visual_method 获取对应模式的配置
             if visual_method == "default":
                 visual_max_duration_min = self.get_config("analysis.default.visual_max_duration_min", 10.0)
                 frame_interval = self.get_config("analysis.default.frame_interval_sec", 6)
-                max_frames = self.get_config("analysis.default.max_frames", 10)
             elif visual_method == "builtin":
                 visual_max_duration_min = self.get_config("analysis.builtin.visual_max_duration_min", 10.0)
                 frame_interval = self.get_config("analysis.builtin.frame_interval_sec", 6)
-                max_frames = self.get_config("analysis.builtin.max_frames", 10)
             elif visual_method == "doubao":
                 visual_max_duration_min = self.get_config("analysis.doubao.visual_max_duration_min", 10.0)
                 frame_interval = 6  # 豆包模式不使用抽帧
-                max_frames = 10  # 豆包模式不使用抽帧
             else:
                 # none 模式或其他：不进行视觉分析
                 visual_max_duration_min = 0
                 frame_interval = 6
-                max_frames = 10
             
             # 同样使用向下取整：10分钟限制 -> 10分59秒的视频仍然进行视觉分析
             visual_max_duration_sec = int((visual_max_duration_min + 1) * 60) - 1
@@ -302,6 +333,7 @@ class VideoService:
             retry_interval_sec = self.get_config("video.retry_interval_sec", 2.0)
             
             # 步骤1: 获取视频基础信息（带重试机制）
+            logger.debug(f"[VideoService] 步骤1: 获取视频信息...")
             video_info = await bilibili_api.get_video_info(
                 video_id, sessdata, page,
                 max_attempts=retry_max_attempts,
@@ -310,6 +342,8 @@ class VideoService:
             if not video_info:
                 result.error = "获取视频信息失败"
                 return result
+            
+            logger.debug(f"[VideoService] 视频信息获取成功: {video_info.get('title', '')[:30]}...")
             
             result.title = video_info.get('title', '')
             result.description = video_info.get('desc', '')  # 视频简介
@@ -338,11 +372,18 @@ class VideoService:
             
             # 步骤2: 获取字幕（如果配置了sessdata，带重试机制）
             if sessdata and result.aid and result.cid:
+                logger.debug(f"[VideoService] 步骤2: 获取字幕...")
                 result.subtitle_text = await bilibili_api.get_subtitle(
                     result.aid, result.cid, sessdata,
                     max_attempts=retry_max_attempts,
                     retry_interval=retry_interval_sec
                 )
+                if result.subtitle_text:
+                    logger.debug(f"[VideoService] 字幕获取成功，长度: {len(result.subtitle_text)}")
+                else:
+                    logger.debug("[VideoService] 该视频没有可用字幕")
+            else:
+                logger.debug("[VideoService] 跳过字幕获取（未配置SESSDATA或缺少aid/cid）")
             
             # 判断是否需要进行视觉分析（向下取整到整分钟）
             if result.duration:
@@ -361,6 +402,7 @@ class VideoService:
             
             # 步骤3: 下载视频（如果需要视觉分析或ASR，带重试机制）
             if need_visual_analysis or enable_asr:
+                logger.debug(f"[VideoService] 步骤3: 下载视频（视觉分析={need_visual_analysis}, ASR={enable_asr}）...")
                 download_info = await bilibili_api.get_video_download_url(
                     video_id, sessdata, page,
                     max_attempts=retry_max_attempts,
@@ -379,11 +421,17 @@ class VideoService:
                 if not result.video_path:
                     result.error = "视频下载失败"
                     return result
+                
+                logger.debug(f"[VideoService] 视频下载完成: {result.video_path}")
+            else:
+                logger.debug("[VideoService] 跳过视频下载（不需要视觉分析和ASR）")
             
             # 步骤4: 视觉分析
             if need_visual_analysis and result.video_path:
+                logger.debug(f"[VideoService] 步骤4: 视觉分析（方式: {visual_method}）...")
                 if visual_method == "doubao":
                     # 使用豆包视频模型
+                    logger.debug("[VideoService] 使用豆包视频模型分析...")
                     result.visual_analysis = await self._analyze_with_doubao(result.video_path)
                     if not result.visual_analysis:
                         logger.warning(f"[VideoService] 豆包分析失败，回退到VLM抽帧")
@@ -392,15 +440,16 @@ class VideoService:
                 # default/builtin 都使用VLM抽帧分析
                 if visual_method in ("default", "builtin") or (visual_method == "doubao" and not result.visual_analysis):
                     # 使用VLM抽帧分析
+                    # 根据视频时长和抽帧间隔自动计算抽帧数量，最多 MAX_EXTRACT_FRAMES 帧
                     if result.duration:
                         n_frames = max(1, int(math.ceil(float(result.duration) / max(1, frame_interval))))
-                        n_frames = min(n_frames, max_frames)
+                        n_frames = min(n_frames, MAX_EXTRACT_FRAMES)
                         result.frame_paths = await self.video_parser.extract_frames_equidistant(
                             result.video_path, result.duration, n_frames
                         )
                     else:
                         result.frame_paths = await self.video_parser.extract_frames(
-                            result.video_path, frame_interval, max_frames
+                            result.video_path, frame_interval, MAX_EXTRACT_FRAMES
                         )
                     
                     if result.frame_paths:
@@ -408,15 +457,24 @@ class VideoService:
                         # 保持原来的visual_method（default或builtin）
                         if result.visual_method not in ("default", "builtin"):
                             result.visual_method = "default"
+                        logger.debug(f"[VideoService] 抽帧完成，共{len(result.frame_paths)}帧")
                     else:
                         logger.warning(f"[VideoService] 视频抽帧失败")
                         result.visual_method = "none"
+            else:
+                logger.debug("[VideoService] 跳过视觉分析（视频时长超过限制或不需要）")
             
             # 步骤5: 如果启用ASR，执行语音识别
             if enable_asr and result.video_path:
+                logger.debug("[VideoService] 步骤5: ASR语音识别...")
                 result.asr_text = await self._extract_audio_text(result.video_path)
+                if result.asr_text:
+                    logger.debug(f"[VideoService] ASR识别完成，长度: {len(result.asr_text)}")
+                else:
+                    logger.debug("[VideoService] ASR识别未返回结果")
             
             result.success = True
+            logger.debug(f"[VideoService] 视频处理完成: {result.title}")
             return result
             
         except NonRetryableError:

@@ -203,12 +203,18 @@ class VideoAnalyzer:
             logger.error("[VideoAnalyzer] 模型未初始化")
             return "未识别"
         
+        logger.debug(f"[VideoAnalyzer] 开始分析帧: {frame_path}")
+        
         # 使用内置VLM
         if self._use_builtin and self._builtin_vlm:
-            return await self._analyze_frame_builtin(frame_path, custom_prompt)
+            result = await self._analyze_frame_builtin(frame_path, custom_prompt)
+            logger.debug(f"[VideoAnalyzer] 内置VLM分析结果: {result}")
+            return result
         
         # 使用MaiBot VLM
-        return await self._analyze_frame_maibot(frame_path, custom_prompt)
+        result = await self._analyze_frame_maibot(frame_path, custom_prompt)
+        logger.debug(f"[VideoAnalyzer] MaiBot VLM分析结果: {result}")
+        return result
     
     async def _analyze_frame_builtin(self, frame_path: str, custom_prompt: str = "") -> Optional[str]:
         """使用内置VLM分析帧"""
@@ -325,14 +331,18 @@ class VideoAnalyzer:
             logger.warning("[VideoAnalyzer] 没有可分析的帧")
             return None
         
+        logger.debug(f"[VideoAnalyzer] 开始分析视频: {video_info.get('title', '未知')}, 帧数: {len(frame_paths)}")
+        
         try:
             title = video_info.get('title', '未知标题')
             duration = video_info.get('duration')
             
             # 第一步：分析关键帧，获取每帧的描述
+            # 硬编码限制：最多分析5帧，避免过多API调用
             frame_descriptions = []
-            # 限制分析的帧数，避免过多API调用
-            max_analyze_frames = min(len(frame_paths), 5)
+            MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
+            max_analyze_frames = min(len(frame_paths), MAX_ANALYZE_FRAMES)
+            logger.debug(f"[VideoAnalyzer] 将分析 {max_analyze_frames} 帧")
             
             for idx, frame_path in enumerate(frame_paths[:max_analyze_frames], start=1):
                 description = await self.analyze_frame(frame_path)
@@ -377,6 +387,7 @@ class VideoAnalyzer:
             )
             
             # 调用replyer模型生成最终总结
+            logger.debug("[VideoAnalyzer] 调用replyer模型生成总结...")
             success, summary, reasoning, model_name = await llm_api.generate_with_model(
                 prompt=final_prompt,
                 model_config=self.replyer_model,
@@ -384,6 +395,7 @@ class VideoAnalyzer:
             )
             
             if success and summary:
+                logger.debug(f"[VideoAnalyzer] 总结生成成功: {len(summary)} 字符")
                 # 清理总结文本
                 summary = summary.strip()
                 # 移除可能的引号包裹

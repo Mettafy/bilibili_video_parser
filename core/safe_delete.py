@@ -300,7 +300,7 @@ def cleanup_old_temp_files(max_age_min: float) -> Dict[str, int]:
                         mtime = item.stat().st_mtime
                         age_sec = current_time - mtime
                         
-                        if age_sec > max_age_sec:
+                        if age_sec >= max_age_sec:
                             # 使用安全删除
                             success, reason = safe_delete_temp_dir(str(item))
                             if success:
@@ -320,7 +320,7 @@ def cleanup_old_temp_files(max_age_min: float) -> Dict[str, int]:
                         mtime = item.stat().st_mtime
                         age_sec = current_time - mtime
                         
-                        if age_sec > max_age_sec:
+                        if age_sec >= max_age_sec:
                             # 使用安全删除
                             success, reason = safe_delete_temp_file(str(item))
                             if success:

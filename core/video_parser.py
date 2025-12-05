@@ -183,6 +183,7 @@ class VideoParser:
         """
         frames = []
         temp_dir = self._create_frames_temp_dir()
+        logger.debug(f"[VideoParser] 开始按间隔抽帧: video={video_path}, interval={interval_sec}s, max_frames={max_frames}")
         
         try:
             # 使用ffmpeg抽帧
@@ -213,6 +214,7 @@ class VideoParser:
                 if os.path.exists(frame_path):
                     frames.append(frame_path)
             
+            logger.debug(f"[VideoParser] 按间隔抽帧完成: 共抽取 {len(frames)} 帧")
             return frames
             
         except Exception as e:
@@ -239,6 +241,7 @@ class VideoParser:
         """
         frames = []
         temp_dir = self._create_frames_temp_dir()
+        logger.debug(f"[VideoParser] 开始等距抽帧: video={video_path}, duration={duration_sec}s, count={count}")
         
         try:
             N = max(1, int(count))
@@ -282,6 +285,7 @@ class VideoParser:
                 else:
                     logger.warning(f"[VideoParser] 在 {t:.3f}s 处抽帧失败")
             
+            logger.debug(f"[VideoParser] 等距抽帧完成: 共抽取 {len(frames)} 帧")
             return frames
             
         except Exception as e:
@@ -408,10 +412,13 @@ class VideoParser:
             "error": None
         }
         
+        logger.debug(f"[VideoParser] 开始解析视频: {video_path}")
+        
         try:
             # 获取视频时长
             duration = self.get_video_duration(video_path)
             result["duration"] = duration
+            logger.debug(f"[VideoParser] 视频时长: {duration}s")
             
             # 抽取关键帧
             frames = await self.extract_frames(
@@ -421,10 +428,14 @@ class VideoParser:
             )
             result["frames"] = frames
             
+            logger.debug(f"[VideoParser] 抽帧完成: {len(frames)} 帧")
+            
             # 提取音频文本(如果启用)
             if enable_asr:
+                logger.debug("[VideoParser] 开始ASR音频识别...")
                 audio_text = await self.extract_audio_text(video_path)
                 result["audio_text"] = audio_text
+                logger.debug(f"[VideoParser] ASR完成: {len(audio_text) if audio_text else 0} 字符")
             
         except Exception as e:
             logger.error(f"[VideoParser] 视频解析失败: {e}")

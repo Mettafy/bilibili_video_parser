@@ -152,6 +152,7 @@ class SummaryService:
             SummaryResult: 总结结果
         """
         result = SummaryResult()
+        logger.debug(f"[SummaryService] 开始生成总结: visual_method={visual_method}")
         
         try:
             # 构建视频信息字典
@@ -164,6 +165,7 @@ class SummaryService:
             # 根据视觉分析方式选择不同的总结生成策略
             if visual_method == "doubao" and visual_analysis:
                 # 豆包模式：使用豆包视频理解结果
+                logger.debug("[SummaryService] 使用豆包模式生成总结")
                 summary = await self._generate_summary_from_doubao(
                     visual_analysis=visual_analysis,
                     title=title,
@@ -174,6 +176,7 @@ class SummaryService:
                 )
             elif visual_method in ("default", "builtin") and frame_paths:
                 # VLM模式（default使用MaiBot VLM，builtin使用插件内置VLM）：使用帧分析
+                logger.debug(f"[SummaryService] 使用VLM模式生成总结: {visual_method}")
                 if not self.video_analyzer or not self.video_analyzer.is_initialized():
                     result.error = "视频分析器未初始化"
                     return result
@@ -189,6 +192,7 @@ class SummaryService:
                 )
             else:
                 # 纯文本模式：仅使用字幕/ASR和视频信息
+                logger.debug("[SummaryService] 使用纯文本模式生成总结")
                 summary = await self._generate_summary_text_only(
                     title=title,
                     description=description,
@@ -200,8 +204,10 @@ class SummaryService:
             if summary:
                 result.success = True
                 result.raw_summary = summary
+                logger.debug(f"[SummaryService] 总结生成成功: {len(summary)} 字符")
             else:
                 result.error = "生成总结失败"
+                logger.debug("[SummaryService] 总结生成失败")
             
             return result
             
@@ -434,10 +440,15 @@ class SummaryService:
             logger.warning("[SummaryService] 没有可分析的帧")
             return None
         
+        logger.debug(f"[SummaryService] 开始VLM帧分析: {len(frame_paths)} 帧")
+        
         try:
             # 第一步：分析关键帧，获取每帧的描述
+            # 硬编码限制：最多分析5帧，避免过多API调用
             frame_descriptions = []
-            max_analyze_frames = min(len(frame_paths), 5)
+            MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
+            max_analyze_frames = min(len(frame_paths), MAX_ANALYZE_FRAMES)
+            logger.debug(f"[SummaryService] 将分析 {max_analyze_frames} 帧")
             
             for idx, frame_path in enumerate(frame_paths[:max_analyze_frames], start=1):
                 desc = await self.video_analyzer.analyze_frame(frame_path)
@@ -535,6 +546,8 @@ class SummaryService:
         Returns:
             个性化回复文本
         """
+        logger.debug("[SummaryService] 开始生成个性化回复（基于总结）")
+        
         try:
             # 获取麦麦的人设信息
             from src.config.config import global_config
@@ -592,10 +605,13 @@ class SummaryService:
 视频内容总结：
 {raw_summary}
 
-请根据你的性格和兴趣，用你的说话风格回复用户，分享你对这个视频的看法或感受。
-{reply_style}
-请直接输出回复内容，不要输出多余内容(包括前后缀，冒号和引号，括号，表情等)。
-回复要简短自然，像日常聊天一样，不要太正式。"""
+请根据你的人设和兴趣，用你的说话风格给出日常且口语化的回复，平淡一些，分享你对这个视频的看法或感受。
+你的说话风格是：{reply_style}
+要求：
+- 尽量简短，像日常聊天一样
+- 不要太有条理，可以有个性
+- 不要用"这个视频讲的是..."这种总结式开头
+- 直接输出回复内容，不要输出多余内容（前后缀、冒号、引号、括号、表情包、at/@等）"""
             
             replyer_model = self._get_replyer_model()
             if not replyer_model:
@@ -642,6 +658,8 @@ class SummaryService:
         Returns:
             个性化回复文本
         """
+        logger.debug("[SummaryService] 开始生成个性化回复（基于原生信息）")
+        
         try:
             # 获取麦麦的人设信息
             from src.config.config import global_config
@@ -735,10 +753,13 @@ class SummaryService:
 视频详细内容：
 {raw_content_block}
 
-请根据你的性格和兴趣，用你的说话风格回复用户，分享你对这个视频的看法或感受。
-{reply_style}
-请直接输出回复内容，不要输出多余内容(包括前后缀，冒号和引号，括号，表情等)。
-回复要简短自然，像日常聊天一样，不要太正式。"""
+请根据你的人设和兴趣，用你的说话风格给出日常且口语化的回复，平淡一些，分享你对这个视频的看法或感受。
+你的说话风格是：{reply_style}
+要求：
+- 尽量简短，像日常聊天一样
+- 不要太有条理，可以有个性
+- 不要用"这个视频讲的是..."这种总结式开头
+- 直接输出回复内容，不要输出多余内容（前后缀、冒号、引号、括号、表情包、at/@等）"""
             
             replyer_model = self._get_replyer_model()
             if not replyer_model:

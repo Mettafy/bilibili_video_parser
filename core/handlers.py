@@ -182,15 +182,19 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
         summary_service = None
         process_result = None
         
+        logger.debug(f"[BilibiliAutoDetect] 开始处理视频: video_id={video_id}, page={page}")
+        
         try:
             # 获取是否启用总结的配置
             enable_summary = self.get_config("analysis.enable_summary", True)
+            logger.debug(f"[BilibiliAutoDetect] enable_summary={enable_summary}")
             
             # 构建缓存key（包含分P号）
             cache_key = f"{video_id}_p{page}" if page > 1 else video_id
+            logger.debug(f"[BilibiliAutoDetect] 缓存key: {cache_key}")
             
             # 检查缓存
-            if self.get_config("cache.enabled", True) and self.cache_manager:
+            if self.get_config("video.cache_enabled", True) and self.cache_manager:
                 cached = self.cache_manager.get_cache(cache_key)
                 if cached:
                     title = cached.get('title', '')
@@ -241,10 +245,12 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                             return message
             
             # 创建服务实例
+            logger.debug("[BilibiliAutoDetect] 创建服务实例...")
             video_service = VideoService(self.video_parser, self.get_config)
             summary_service = SummaryService(self.video_analyzer, self.get_config)
             
             # 步骤1: 处理视频（下载、抽帧、获取字幕/ASR）
+            logger.debug("[BilibiliAutoDetect] 步骤1: 开始处理视频...")
             try:
                 process_result = await video_service.process_video(video_id, BilibiliAPI, page)
             except NonRetryableError as e:
@@ -275,9 +281,11 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
             }
             
             # 获取帧描述（如果有帧的话）
+            # 硬编码限制：最多分析5帧，避免过多API调用
             frame_descriptions = []
+            MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
             if process_result.frame_paths and self.video_analyzer and self.video_analyzer.is_initialized():
-                max_analyze_frames = min(len(process_result.frame_paths), 5)
+                max_analyze_frames = min(len(process_result.frame_paths), MAX_ANALYZE_FRAMES)
                 for idx, frame_path in enumerate(process_result.frame_paths[:max_analyze_frames], start=1):
                     logger.debug(f"[BilibiliAutoDetect] 分析第 {idx}/{max_analyze_frames} 帧")
                     desc = await self.video_analyzer.analyze_frame(frame_path)
@@ -297,6 +305,7 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
             
             if enable_summary:
                 # 步骤2: 生成总结
+                logger.debug("[BilibiliAutoDetect] 步骤2: 生成总结...")
                 summary_result = await summary_service.generate_summary(
                     frame_paths=process_result.frame_paths,
                     video_info=video_info,
@@ -327,7 +336,8 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                 message.modify_plain_text(new_text)
                 
                 # 步骤4: 保存缓存（包含原生信息和总结）
-                if self.get_config("cache.enabled", True) and self.cache_manager:
+                logger.debug("[BilibiliAutoDetect] 步骤4: 保存缓存...")
+                if self.get_config("video.cache_enabled", True) and self.cache_manager:
                     cache_data = {
                         "video_id": video_id,
                         "page": process_result.page,
@@ -351,7 +361,7 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                 message.modify_plain_text(new_text)
                 
                 # 保存缓存（仅原生信息，无总结）
-                if self.get_config("cache.enabled", True) and self.cache_manager:
+                if self.get_config("video.cache_enabled", True) and self.cache_manager:
                     cache_data = {
                         "video_id": video_id,
                         "page": process_result.page,
@@ -566,6 +576,7 @@ class BilibiliCommandHandler(BaseCommand):
                 logger.info(f"[BilibiliCommand] 处理视频: {video_id}")
             
             # 创建服务实例
+            logger.debug("[BilibiliCommand] 创建服务实例...")
             video_service = VideoService(self.video_parser, self.get_config)
             summary_service = SummaryService(self.video_analyzer, self.get_config)
             
@@ -583,7 +594,7 @@ class BilibiliCommandHandler(BaseCommand):
             video_total_pages = 1
             raw_info = None
             
-            if self.get_config("cache.enabled", True) and self.cache_manager:
+            if self.get_config("video.cache_enabled", True) and self.cache_manager:
                 cached = self.cache_manager.get_cache(cache_key)
                 if cached:
                     video_title = cached.get('title', '')
@@ -598,6 +609,7 @@ class BilibiliCommandHandler(BaseCommand):
             
             # 如果没有缓存或缓存中没有原生信息，处理视频
             if not raw_info:
+                logger.debug("[BilibiliCommand] 缓存未命中，开始处理视频...")
                 try:
                     process_result = await video_service.process_video(video_id, BilibiliAPI, page)
                 except NonRetryableError as e:
@@ -631,9 +643,11 @@ class BilibiliCommandHandler(BaseCommand):
                 video_total_pages = process_result.total_pages
                 
                 # 获取帧描述（如果有帧的话）
+                # 硬编码限制：最多分析5帧，避免过多API调用
                 frame_descriptions = []
+                MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
                 if process_result.frame_paths and self.video_analyzer and self.video_analyzer.is_initialized():
-                    max_analyze_frames = min(len(process_result.frame_paths), 5)
+                    max_analyze_frames = min(len(process_result.frame_paths), MAX_ANALYZE_FRAMES)
                     for idx, frame_path in enumerate(process_result.frame_paths[:max_analyze_frames], start=1):
                         desc = await self.video_analyzer.analyze_frame(frame_path)
                         if desc and desc != "未识别":
@@ -651,7 +665,7 @@ class BilibiliCommandHandler(BaseCommand):
                 }
                 
                 # 保存缓存（包含原生信息，命令模式不生成总结）
-                if self.get_config("cache.enabled", True) and self.cache_manager:
+                if self.get_config("video.cache_enabled", True) and self.cache_manager:
                     cache_data = {
                         "video_id": video_id,
                         "page": video_page,
@@ -683,6 +697,7 @@ class BilibiliCommandHandler(BaseCommand):
             }
             
             # 使用原生信息生成个性化回复（跳过总结生成）
+            logger.debug("[BilibiliCommand] 生成个性化回复...")
             personalized_reply = await summary_service.generate_personalized_reply_from_raw_info(
                 video_info=video_info_dict,
                 raw_info=raw_info

@@ -69,10 +69,10 @@ class DoubaoAnalyzer:
     
     DEFAULT_VIDEO_PROMPT = """请详细描述这个视频的内容，包括：
 1. 视频的主要场景和环境
-2. 出现的人物、物体及其特征
-3. 发生的主要事件和动作
+2. 出现的人物、物体及其特征（如是已知作品角色请指出名称和作品）
+3. 发生的主要事件和动作（按时间顺序）
 4. 视频的整体氛围和风格
-5. 任何出现的文字、标志或重要信息
+5. 任何出现的文字、标志或重要信息（如字幕、对话等）
 
 请用简洁清晰的语言描述，突出关键信息。"""
     
@@ -123,6 +123,11 @@ class DoubaoAnalyzer:
     async def analyze_video(self, video_path: str, custom_prompt: str = "") -> Optional[str]:
         """分析视频内容
         
+        采用动态参数传递策略：
+        - 只传递用户在配置中实际定义的参数
+        - 不同版本的豆包API可能支持不同的参数
+        - 用户可以自由添加豆包特有的参数
+        
         Args:
             video_path: 本地视频文件路径
             custom_prompt: 自定义提示词（可选）
@@ -137,29 +142,59 @@ class DoubaoAnalyzer:
             logger.error(f"[DoubaoAnalyzer] 视频文件不存在: {video_path}")
             return None
         
+        # 必需参数
         model_id = self.config.get("model_id", "doubao-seed-1-6-251015")
-        fps = self.config.get("fps", 1.0)
         timeout = self.config.get("timeout", 120)
         max_retries = self.config.get("max_retries", 2)
         retry_interval = self.config.get("retry_interval", 10)
         
         prompt = custom_prompt or self.config.get("video_prompt", "") or self.DEFAULT_VIDEO_PROMPT
         
+        # 构建动态视频预处理配置
+        # 只传递用户配置的参数
+        video_preprocess_config = {}
+        if "fps" in self.config and self.config["fps"] is not None:
+            video_preprocess_config["fps"] = self.config["fps"]
+        
+        # 已知的非API参数（不应传递给API）
+        non_api_params = {
+            "api_key", "model_id", "base_url", "timeout", "max_retries",
+            "retry_interval", "video_prompt", "visual_max_duration_min"
+        }
+        
+        # 构建动态API参数
+        api_params = {
+            "model": model_id,
+        }
+        
+        # 动态添加可选参数（只有用户配置了才传递）
+        optional_api_params = ["temperature", "max_tokens", "top_p", "top_k"]
+        for param in optional_api_params:
+            if param in self.config and self.config[param] is not None:
+                api_params[param] = self.config[param]
+        
+        # 添加用户自定义的额外参数（豆包特有参数）
+        for key, value in self.config.items():
+            if key not in non_api_params and key not in optional_api_params and key not in api_params and key != "fps":
+                if value is not None:
+                    api_params[key] = value
+        
+        logger.debug(f"[DoubaoAnalyzer] API参数: {list(api_params.keys())}")
+        logger.debug(f"[DoubaoAnalyzer] 视频预处理配置: {video_preprocess_config}")
+        
         for attempt in range(max_retries + 1):
             try:
                 logger.debug(f"[DoubaoAnalyzer] 开始上传视频文件 (尝试 {attempt + 1}/{max_retries + 1})")
                 
-                # 上传视频文件
-                with open(video_path, "rb") as f:
-                    file = await self._client.files.create(
-                        file=f,
-                        purpose="user_data",
-                        preprocess_configs={
-                            "video": {
-                                "fps": fps
-                            }
-                        }
-                    )
+                # 上传视频文件（动态构建预处理配置）
+                upload_kwargs = {
+                    "file": open(video_path, "rb"),
+                    "purpose": "user_data",
+                }
+                if video_preprocess_config:
+                    upload_kwargs["preprocess_configs"] = {"video": video_preprocess_config}
+                
+                file = await self._client.files.create(**upload_kwargs)
                 
                 logger.debug(f"[DoubaoAnalyzer] 视频上传成功: {file.id}，等待处理...")
                 
@@ -167,25 +202,28 @@ class DoubaoAnalyzer:
                 await self._client.files.wait_for_processing(file.id)
                 logger.debug(f"[DoubaoAnalyzer] 视频处理完成: {file.id}")
                 
+                # 构建请求参数
+                request_params = {
+                    **api_params,
+                    "input": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_video",
+                                "file_id": file.id
+                            },
+                            {
+                                "type": "input_text",
+                                "text": prompt
+                            }
+                        ]
+                    }]
+                }
+                
                 # 调用视频理解API
                 logger.debug("[DoubaoAnalyzer] 开始视频理解分析...")
                 response = await asyncio.wait_for(
-                    self._client.responses.create(
-                        model=model_id,
-                        input=[{
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_video",
-                                    "file_id": file.id
-                                },
-                                {
-                                    "type": "input_text",
-                                    "text": prompt
-                                }
-                            ]
-                        }]
-                    ),
+                    self._client.responses.create(**request_params),
                     timeout=timeout
                 )
                 

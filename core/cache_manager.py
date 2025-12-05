@@ -152,9 +152,11 @@ class CacheManager:
             缓存数据，不存在返回None
         """
         video_hash = self._calculate_video_hash(video_id)
+        logger.debug(f"[CacheManager] 查询缓存: video_id={video_id}, hash={video_hash}")
         
         # 检查索引
         if video_hash not in self.index:
+            logger.debug(f"[CacheManager] 缓存未命中: {video_id}")
             return None
         
         # 读取缓存文件
@@ -168,6 +170,7 @@ class CacheManager:
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cache_data = json.load(f)
+            logger.debug(f"[CacheManager] 缓存命中: {video_id}")
             return cache_data
         except Exception as e:
             logger.error(f"[CacheManager] 读取缓存失败: {e}")
@@ -192,6 +195,7 @@ class CacheManager:
         video_hash = self._calculate_video_hash(video_id)
         cache_file = self.cache_dir / f"{video_hash}.json"
         temp_file = None
+        logger.debug(f"[CacheManager] 保存缓存: video_id={video_id}, hash={video_hash}")
         
         try:
             # 生成唯一的临时文件名（避免多个写入操作使用同一临时文件）
@@ -210,6 +214,7 @@ class CacheManager:
                 "file": f"{video_hash}.json"
             }
             self._save_index()
+            logger.debug(f"[CacheManager] 缓存保存成功: {video_id}")
             return True
         except Exception as e:
             logger.error(f"[CacheManager] 保存缓存失败: {e}")
