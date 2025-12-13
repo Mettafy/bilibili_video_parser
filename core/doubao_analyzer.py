@@ -67,13 +67,15 @@ class DoubaoAnalyzer:
     使用火山引擎豆包视频理解模型分析视频内容
     """
     
-    DEFAULT_VIDEO_PROMPT = """请详细描述这个视频的内容，包括：
+    DEFAULT_VIDEO_PROMPT = """请详细描述这个视频的内容（{summary_min_chars}-{summary_max_chars}字以内），包括：
 1. 视频的主要场景和环境
 2. 出现的人物、物体及其特征（如是已知作品角色请指出名称和作品）
 3. 发生的主要事件和动作（按时间顺序）
 4. 视频的整体氛围和风格
 5. 任何出现的文字、标志或重要信息（如字幕、对话等）
 
+仅描述视频中实际出现的内容，不要推测或编造未出现的信息。
+若某些信息无法从视频中判断，请明确说明'无法判断'。
 请用简洁清晰的语言描述，突出关键信息。"""
     
     def __init__(self, config: Dict[str, Any]):
@@ -148,7 +150,20 @@ class DoubaoAnalyzer:
         max_retries = self.config.get("max_retries", 2)
         retry_interval = self.config.get("retry_interval", 10)
         
+        # 获取字数配置
+        summary_min_chars = self.config.get("summary_min_chars", 100)
+        summary_max_chars = self.config.get("summary_max_chars", 150)
+        
+        # 获取提示词并格式化字数范围
         prompt = custom_prompt or self.config.get("video_prompt", "") or self.DEFAULT_VIDEO_PROMPT
+        try:
+            prompt = prompt.format(
+                summary_min_chars=summary_min_chars,
+                summary_max_chars=summary_max_chars
+            )
+        except KeyError:
+            # 如果用户自定义提示词没有使用占位符，忽略格式化错误
+            pass
         
         # 构建动态视频预处理配置
         # 只传递用户配置的参数

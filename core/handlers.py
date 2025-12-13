@@ -221,7 +221,9 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                                 duration=duration,
                                 total_duration=total_duration
                             )
-                            new_text = f"{message.plain_text}\n\n{video_info_text}"
+                            # 简化原始消息中的B站链接，避免消息过长被截断
+                            simplified_text = self._simplify_bilibili_links(message.plain_text, video_id)
+                            new_text = f"{simplified_text}\n\n{video_info_text}"
                             message.modify_plain_text(new_text)
                             return message
                     else:
@@ -240,7 +242,9 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                             }
                             summary_service = SummaryService(self.video_analyzer, self.get_config)
                             video_info_text = summary_service.build_raw_info_text(video_info, raw_info)
-                            new_text = f"{message.plain_text}\n\n{video_info_text}"
+                            # 简化原始消息中的B站链接，避免消息过长被截断
+                            simplified_text = self._simplify_bilibili_links(message.plain_text, video_id)
+                            new_text = f"{simplified_text}\n\n{video_info_text}"
                             message.modify_plain_text(new_text)
                             return message
             
@@ -280,19 +284,21 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                 'total_pages': process_result.total_pages,
             }
             
-            # 获取帧描述（如果有帧的话）
-            # 硬编码限制：最多分析5帧，避免过多API调用
-            frame_descriptions = []
-            MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
-            if process_result.frame_paths and self.video_analyzer and self.video_analyzer.is_initialized():
-                max_analyze_frames = min(len(process_result.frame_paths), MAX_ANALYZE_FRAMES)
-                for idx, frame_path in enumerate(process_result.frame_paths[:max_analyze_frames], start=1):
-                    logger.debug(f"[BilibiliAutoDetect] 分析第 {idx}/{max_analyze_frames} 帧")
-                    desc = await self.video_analyzer.analyze_frame(frame_path)
-                    if desc and desc != "未识别":
-                        frame_descriptions.append(f"帧{idx}: {desc}")
-                    else:
-                        frame_descriptions.append(f"帧{idx}: 画面内容未识别")
+            # 步骤2: 生成总结（帧分析在 summary_service 内部进行，避免重复分析）
+            # 注意：帧分析只在 summary_service.generate_summary() 内部进行
+            # handlers.py 不应进行帧分析，这是职责分离的关键
+            logger.debug("[BilibiliAutoDetect] 步骤2: 生成总结...")
+            summary_result = await summary_service.generate_summary(
+                frame_paths=process_result.frame_paths,
+                video_info=video_info,
+                text_content=process_result.get_text_content(),
+                visual_analysis=process_result.visual_analysis,
+                visual_method=process_result.visual_method
+            )
+            
+            # 从 summary_result 获取帧描述用于缓存
+            # 帧描述由 summary_service 在分析过程中生成
+            frame_descriptions = summary_result.frame_descriptions
             
             # 构建原生信息字典
             raw_info = {
@@ -304,16 +310,6 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
             }
             
             if enable_summary:
-                # 步骤2: 生成总结
-                logger.debug("[BilibiliAutoDetect] 步骤2: 生成总结...")
-                summary_result = await summary_service.generate_summary(
-                    frame_paths=process_result.frame_paths,
-                    video_info=video_info,
-                    text_content=process_result.get_text_content(),
-                    visual_analysis=process_result.visual_analysis,
-                    visual_method=process_result.visual_method
-                )
-                
                 if not summary_result.success or not summary_result.raw_summary:
                     logger.error(f"[BilibiliAutoDetect] 生成总结失败: {summary_result.error}")
                     return None
@@ -332,7 +328,9 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                     duration=process_result.duration,
                     total_duration=process_result.total_duration
                 )
-                new_text = f"{message.plain_text}\n\n{video_info_text}"
+                # 简化原始消息中的B站链接，避免消息过长被截断
+                simplified_text = self._simplify_bilibili_links(message.plain_text, video_id)
+                new_text = f"{simplified_text}\n\n{video_info_text}"
                 message.modify_plain_text(new_text)
                 
                 # 步骤4: 保存缓存（包含原生信息和总结）
@@ -357,7 +355,9 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
             else:
                 # 不生成总结，直接使用原生信息
                 video_info_text = summary_service.build_raw_info_text(video_info, raw_info)
-                new_text = f"{message.plain_text}\n\n{video_info_text}"
+                # 简化原始消息中的B站链接，避免消息过长被截断
+                simplified_text = self._simplify_bilibili_links(message.plain_text, video_id)
+                new_text = f"{simplified_text}\n\n{video_info_text}"
                 message.modify_plain_text(new_text)
                 
                 # 保存缓存（仅原生信息，无总结）
@@ -489,6 +489,31 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
             parts.append(f"{secs}秒")
         
         return "".join(parts) if parts else "0秒"
+    
+    def _simplify_bilibili_links(self, text: str, video_id: str) -> str:
+        """简化消息中的B站链接，减少消息长度
+        
+        将长链接替换为简化的视频ID，避免消息过长被截断
+        
+        Args:
+            text: 原始消息文本
+            video_id: 已解析的视频ID（BV号或AV号）
+            
+        Returns:
+            简化后的消息文本
+        """
+        # 替换完整B站链接（包含各种参数）为视频ID
+        # 匹配: https://www.bilibili.com/video/BVxxx?各种参数
+        # 匹配: https://m.bilibili.com/video/BVxxx?各种参数
+        bilibili_url_pattern = r'https?://(?:www\.|m\.)?bilibili\.com/video/(?:BV[a-zA-Z0-9]{10}|av\d+)[^\s]*'
+        text = re.sub(bilibili_url_pattern, video_id, text)
+        
+        # 替换b23.tv短链接（包含各种参数）为简化形式
+        # 匹配: https://b23.tv/xxx?各种参数
+        short_url_pattern = r'https?://b23\.tv/([a-zA-Z0-9]+)[^\s]*'
+        text = re.sub(short_url_pattern, rf'b23.tv/\1', text)
+        
+        return text
 
 
 class BilibiliCommandHandler(BaseCommand):
@@ -649,18 +674,33 @@ class BilibiliCommandHandler(BaseCommand):
                 video_page_title = process_result.page_title
                 video_total_pages = process_result.total_pages
                 
-                # 获取帧描述（如果有帧的话）
-                # 硬编码限制：最多分析5帧，避免过多API调用
-                frame_descriptions = []
-                MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
-                if process_result.frame_paths and self.video_analyzer and self.video_analyzer.is_initialized():
-                    max_analyze_frames = min(len(process_result.frame_paths), MAX_ANALYZE_FRAMES)
-                    for idx, frame_path in enumerate(process_result.frame_paths[:max_analyze_frames], start=1):
-                        desc = await self.video_analyzer.analyze_frame(frame_path)
-                        if desc and desc != "未识别":
-                            frame_descriptions.append(f"帧{idx}: {desc}")
-                        else:
-                            frame_descriptions.append(f"帧{idx}: 画面内容未识别")
+                # 构建视频信息字典（用于生成总结）
+                temp_video_info = {
+                    'title': video_title,
+                    'description': video_description,
+                    'author': video_author,
+                    'duration': video_duration,
+                    'total_duration': video_total_duration,
+                    'video_id': video_id,
+                    'page': video_page,
+                    'page_title': video_page_title,
+                    'total_pages': video_total_pages,
+                }
+                
+                # 通过 summary_service.generate_summary 获取帧描述
+                # 帧分析只在 summary_service 内部进行，避免重复分析
+                # 注意：这里调用 generate_summary 主要是为了获取帧描述用于缓存
+                logger.debug("[BilibiliCommand] 通过 summary_service 获取帧描述...")
+                temp_summary_result = await summary_service.generate_summary(
+                    frame_paths=process_result.frame_paths,
+                    video_info=temp_video_info,
+                    text_content=process_result.get_text_content(),
+                    visual_analysis=process_result.visual_analysis,
+                    visual_method=process_result.visual_method
+                )
+                
+                # 从 summary_result 获取帧描述
+                frame_descriptions = temp_summary_result.frame_descriptions
                 
                 # 构建原生信息字典
                 raw_info = {
@@ -671,7 +711,10 @@ class BilibiliCommandHandler(BaseCommand):
                     'visual_method': process_result.visual_method
                 }
                 
-                # 保存缓存（包含原生信息，命令模式不生成总结）
+                # 如果总结生成成功，也缓存总结
+                cached_summary = temp_summary_result.raw_summary if temp_summary_result.success else None
+                
+                # 保存缓存（包含原生信息和可能的总结）
                 if self.get_config("video.cache_enabled", True) and self.cache_manager:
                     cache_data = {
                         "video_id": video_id,
@@ -684,7 +727,7 @@ class BilibiliCommandHandler(BaseCommand):
                         "duration": video_duration,
                         "total_duration": video_total_duration,
                         "raw_info": raw_info,
-                        "summary": None,  # 命令模式不生成总结
+                        "summary": cached_summary,  # 缓存总结（如果生成成功）
                         "has_subtitle": bool(process_result.subtitle_text) if process_result else False,
                         "has_asr": bool(process_result.asr_text) if process_result else False
                     }
@@ -802,7 +845,9 @@ class BilibiliCommandHandler(BaseCommand):
             # 这样存储到数据库后，replyer可以看到完整的视频信息
             video_info_text = summary_service.build_raw_info_text(video_info_dict, raw_info)
             original_text = self.message.processed_plain_text
-            self.message.processed_plain_text = f"{original_text}\n\n{video_info_text}"
+            # 简化原始消息中的B站链接，避免消息过长被截断
+            simplified_text = self._simplify_bilibili_links(original_text, video_id)
+            self.message.processed_plain_text = f"{simplified_text}\n\n{video_info_text}"
             
             # 返回 intercept_message_level=1，让用户命令消息对replyer可见但不触发回复
             return True, None, 1
@@ -947,3 +992,28 @@ class BilibiliCommandHandler(BaseCommand):
             return "请求过于频繁，请稍后重试"
         
         return error
+    
+    def _simplify_bilibili_links(self, text: str, video_id: str) -> str:
+        """简化消息中的B站链接，减少消息长度
+        
+        将长链接替换为简化的视频ID，避免消息过长被截断
+        
+        Args:
+            text: 原始消息文本
+            video_id: 已解析的视频ID（BV号或AV号）
+            
+        Returns:
+            简化后的消息文本
+        """
+        # 替换完整B站链接（包含各种参数）为视频ID
+        # 匹配: https://www.bilibili.com/video/BVxxx?各种参数
+        # 匹配: https://m.bilibili.com/video/BVxxx?各种参数
+        bilibili_url_pattern = r'https?://(?:www\.|m\.)?bilibili\.com/video/(?:BV[a-zA-Z0-9]{10}|av\d+)[^\s]*'
+        text = re.sub(bilibili_url_pattern, video_id, text)
+        
+        # 替换b23.tv短链接（包含各种参数）为简化形式
+        # 匹配: https://b23.tv/xxx?各种参数
+        short_url_pattern = r'https?://b23\.tv/([a-zA-Z0-9]+)[^\s]*'
+        text = re.sub(short_url_pattern, rf'b23.tv/\1', text)
+        
+        return text

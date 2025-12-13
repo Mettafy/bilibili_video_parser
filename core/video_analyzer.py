@@ -220,17 +220,28 @@ class VideoAnalyzer:
         """使用内置VLM分析帧"""
         if not self._builtin_vlm:
             return "未识别"
-            
-        prompt = custom_prompt or self.vlm_config.get("frame_prompt", "") or \
-                 "请用一句中文描述这张图片的主要内容，少于25字。若无法判断，请回答'未识别'。"
+        
+        # 约束部分（始终追加到提示词末尾）
+        constraint_suffix = "仅描述画面中实际出现的内容，不要推测或编造。若无法判断，请回答'未识别'。"
+        
+        # 获取用户自定义提示词或配置中的提示词
+        user_prompt = custom_prompt or self.vlm_config.get("frame_prompt", "")
+        
+        if user_prompt:
+            # 用户设置了自定义提示词，追加约束部分
+            prompt = f"{user_prompt} {constraint_suffix}"
+        else:
+            # 使用默认提示词
+            prompt = f"请用一句中文描述这张视频截图的画面要点，少于25字。{constraint_suffix}"
         
         try:
             result = await self._builtin_vlm.analyze_frame(frame_path, prompt)
             if result:
                 # 清理响应文本
                 description = result.strip()
-                if len(description) > 50:
-                    description = description[:50]
+                # 强制截断：最大3000字符（用户可通过自定义提示词控制实际长度）
+                if len(description) > 3000:
+                    description = description[:3000]
                 return description
             return "未识别"
         except Exception as e:
@@ -243,7 +254,18 @@ class VideoAnalyzer:
             logger.error("[VideoAnalyzer] VLM模型未初始化")
             return "未识别"
         
-        prompt = custom_prompt or "请用一句中文描述这张图片的主要内容，少于25字。若无法判断，请回答'未识别'。"
+        # 约束部分（始终追加到提示词末尾）
+        constraint_suffix = "仅描述画面中实际出现的内容，不要推测或编造。若无法判断，请回答'未识别'。"
+        
+        # 获取用户自定义提示词或配置中的提示词
+        user_prompt = custom_prompt or self.vlm_config.get("frame_prompt", "")
+        
+        if user_prompt:
+            # 用户设置了自定义提示词，追加约束部分
+            prompt = f"{user_prompt} {constraint_suffix}"
+        else:
+            # 使用默认提示词
+            prompt = f"请用一句中文描述这张视频截图的画面要点，少于25字。{constraint_suffix}"
         
         try:
             # 读取图片文件并转为base64
@@ -292,8 +314,9 @@ class VideoAnalyzer:
             if success and response:
                 # 清理响应文本
                 description = response.strip()
-                if len(description) > 50:
-                    description = description[:50]
+                # 强制截断：最大3000字符（用户可通过自定义提示词控制实际长度）
+                if len(description) > 3000:
+                    description = description[:3000]
                 return description
             else:
                 logger.warning(f"[VideoAnalyzer] VLM分析失败: {response}")

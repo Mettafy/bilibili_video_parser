@@ -79,6 +79,7 @@ class BuiltinVLMClient:
 3. 画面中的文字（字幕、对话框、界面文本等）
 4. 正在发生的事件或动作
 
+仅描述画面中实际出现的内容，不要推测或编造未出现的信息。
 输出为一段连贯的描述文本。"""
     
     def __init__(self, config: Dict[str, Any]):

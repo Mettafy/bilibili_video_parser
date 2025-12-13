@@ -76,7 +76,7 @@ SummaryResult 字段：
 Author: 约瑟夫.k && 白泽
 """
 from typing import Optional, List, Dict, Any, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from src.plugin_system import llm_api, get_logger
 
 logger = get_logger("summary_service")
@@ -89,6 +89,7 @@ class SummaryResult:
     error: Optional[str] = None
     raw_summary: Optional[str] = None  # 原始总结
     personalized_reply: Optional[str] = None  # 个性化回复（命令模式使用）
+    frame_descriptions: List[str] = field(default_factory=list)  # 帧描述列表（用于缓存）
 
 
 class SummaryService:
@@ -123,7 +124,7 @@ class SummaryService:
         """
         default_chars = 200
         min_chars = 60
-        max_chars = 6000
+        max_chars = 2000
         
         try:
             value = self.get_config("summary.summary_max_chars", default_chars)
@@ -179,6 +180,9 @@ class SummaryService:
         2. 豆包模式：使用豆包视频理解结果生成总结
         3. 纯文本模式：仅使用字幕/ASR生成总结
         
+        帧分析只在此方法内部进行，handlers.py 不应进行帧分析。
+        帧描述会保存到 SummaryResult.frame_descriptions 中，供调用方用于缓存。
+        
         Args:
             frame_paths: 帧图片路径列表（VLM模式使用）
             video_info: 视频信息字典，包含title、description、duration、author等
@@ -187,7 +191,7 @@ class SummaryService:
             visual_method: 视觉分析方式：default、builtin、doubao、none
             
         Returns:
-            SummaryResult: 总结结果
+            SummaryResult: 总结结果（包含 frame_descriptions 用于缓存）
         """
         result = SummaryResult()
         logger.debug(f"[SummaryService] 开始生成总结: visual_method={visual_method}")
@@ -212,6 +216,7 @@ class SummaryService:
                     duration=duration,
                     text_content=text_content
                 )
+                # 豆包模式没有帧描述，frame_descriptions 保持为空列表
             elif visual_method in ("default", "builtin") and frame_paths:
                 # VLM模式（default使用MaiBot VLM，builtin使用插件内置VLM）：使用帧分析
                 logger.debug(f"[SummaryService] 使用VLM模式生成总结: {visual_method}")
@@ -219,7 +224,8 @@ class SummaryService:
                     result.error = "视频分析器未初始化"
                     return result
                 
-                summary = await self._analyze_video_with_description(
+                # 帧分析在此方法内部进行，返回总结和帧描述
+                summary, frame_descriptions = await self._analyze_video_with_description(
                     frame_paths=frame_paths,
                     title=title,
                     description=description,
@@ -228,6 +234,8 @@ class SummaryService:
                     video_id=video_id,
                     text_content=text_content
                 )
+                # 保存帧描述到结果中，供调用方用于缓存
+                result.frame_descriptions = frame_descriptions
             else:
                 # 纯文本模式：仅使用字幕/ASR和视频信息
                 logger.debug("[SummaryService] 使用纯文本模式生成总结")
@@ -238,6 +246,7 @@ class SummaryService:
                     duration=duration,
                     text_content=text_content
                 )
+                # 纯文本模式没有帧描述，frame_descriptions 保持为空列表
             
             if summary:
                 result.success = True
@@ -316,12 +325,13 @@ class SummaryService:
             
             # 构建提示词
             final_prompt = (
-                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字以内）。\n"
+                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字左右）。\n"
                 f"要求：\n"
-                f"1. 只描述视频的客观内容，不要加入主观评价或感受\n"
-                f"2. 不要使用'你'、'我'等人称代词\n"
-                f"3. 不要说'这是一段XX制作的视频'，直接描述视频内容\n"
-                f"4. 只输出总结内容本身，不要输出任何标题、说明、解释、格式标记\n\n"
+                f"1. 仅依据已给信息进行总结，信息不足请说明'无法判断'，不要编造未出现的内容\n"
+                f"2. 只描述视频的客观内容，不要加入主观评价或感受\n"
+                f"3. 不要使用'你'、'我'等人称代词\n"
+                f"4. 不要说'这是一段XX制作的视频'，直接描述视频内容\n"
+                f"5. 只输出总结内容本身，不要输出任何标题、说明、解释、格式标记\n\n"
                 f"{meta_block}"
                 f"{description_block}\n\n"
                 f"视频内容分析（AI视觉理解）:\n{visual_analysis}"
@@ -414,13 +424,14 @@ class SummaryService:
             
             # 构建提示词
             final_prompt = (
-                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字以内）。\n"
+                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字左右）。\n"
                 f"注意：由于视频时长较长，未进行视觉分析，请主要基于字幕/语音内容和视频简介进行总结。\n"
                 f"要求：\n"
-                f"1. 只描述视频的客观内容，不要加入主观评价或感受\n"
-                f"2. 不要使用'你'、'我'等人称代词\n"
-                f"3. 不要说'这是一段XX制作的视频'，直接描述视频内容\n"
-                f"4. 只输出总结内容本身，不要输出任何标题、说明、解释、格式标记\n\n"
+                f"1. 仅依据已给信息进行总结，信息不足请说明'无法判断'，不要编造未出现的内容\n"
+                f"2. 只描述视频的客观内容，不要加入主观评价或感受\n"
+                f"3. 不要使用'你'、'我'等人称代词\n"
+                f"4. 不要说'这是一段XX制作的视频'，直接描述视频内容\n"
+                f"5. 只输出总结内容本身，不要输出任何标题、说明、解释、格式标记\n\n"
                 f"{meta_block}"
                 f"{description_block}"
                 f"{text_block}"
@@ -457,8 +468,11 @@ class SummaryService:
         duration: Optional[int],
         video_id: str,
         text_content: Optional[str]
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], List[str]]:
         """分析视频并生成总结（支持视频简介和作者信息）
+        
+        帧分析在此方法内部进行，这是唯一进行帧分析的地方。
+        handlers.py 不应进行帧分析，避免重复分析。
         
         Args:
             frame_paths: 帧图片路径列表
@@ -470,31 +484,35 @@ class SummaryService:
             text_content: 文本内容（字幕或ASR）
             
         Returns:
-            总结文本
+            tuple[Optional[str], List[str]]: (总结文本, 帧描述列表)
+            帧描述列表用于缓存，格式如 ["帧1: 描述", "帧2: 描述", ...]
         """
         if not self.video_analyzer or not self.video_analyzer.is_initialized():
             logger.error("[SummaryService] 视频分析器未初始化")
-            return None
+            return None, []
         
         if not self.video_analyzer.replyer_model:
             logger.error("[SummaryService] Replyer模型未初始化")
-            return None
+            return None, []
         
         if not frame_paths:
             logger.warning("[SummaryService] 没有可分析的帧")
-            return None
+            return None, []
         
         logger.debug(f"[SummaryService] 开始VLM帧分析: {len(frame_paths)} 帧")
+        
+        # 帧描述列表，用于返回给调用方缓存
+        frame_descriptions = []
         
         try:
             # 第一步：分析关键帧，获取每帧的描述
             # 硬编码限制：最多分析5帧，避免过多API调用
-            frame_descriptions = []
             MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
             max_analyze_frames = min(len(frame_paths), MAX_ANALYZE_FRAMES)
             logger.debug(f"[SummaryService] 将分析 {max_analyze_frames} 帧")
             
             for idx, frame_path in enumerate(frame_paths[:max_analyze_frames], start=1):
+                logger.debug(f"[SummaryService] 分析第 {idx}/{max_analyze_frames} 帧")
                 desc = await self.video_analyzer.analyze_frame(frame_path)
                 if desc and desc != "未识别":
                     frame_descriptions.append(f"帧{idx}: {desc}")
@@ -541,12 +559,13 @@ class SummaryService:
             
             # 构建最终提示词（客观视角）
             final_prompt = (
-                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字以内）。\n"
+                f"根据以下B站视频信息，以客观第三方视角输出一段简洁的视频内容总结（{summary_max_chars}字左右）。\n"
                 f"要求：\n"
-                f"1. 只描述视频的客观内容，不要加入主观评价或感受\n"
-                f"2. 不要使用'你'、'我'等人称代词\n"
-                f"3. 不要说'这是一段XX制作的视频'，直接描述视频内容\n"
-                f"4. 只输出总结内容本身，不要输出任何标题、说明、解释、格式标记\n\n"
+                f"1. 仅依据已给信息进行总结，信息不足请说明'无法判断'，不要编造未出现的内容\n"
+                f"2. 只描述视频的客观内容，不要加入主观评价或感受\n"
+                f"3. 不要使用'你'、'我'等人称代词\n"
+                f"4. 不要说'这是一段XX制作的视频'，直接描述视频内容\n"
+                f"5. 只输出总结内容本身，不要输出任何标题、说明、解释、格式标记\n\n"
                 f"{meta_block}"
                 f"{description_block}\n\n"
                 f"关键帧描述:\n{frames_block}"
@@ -568,14 +587,14 @@ class SummaryService:
                 if summary.startswith("'") and summary.endswith("'"):
                     summary = summary[1:-1]
                 summary = self.video_analyzer._clean_summary(summary)
-                return summary
+                return summary, frame_descriptions
             else:
                 logger.error(f"[SummaryService] 生成总结失败: {summary}")
-                return None
+                return None, frame_descriptions
                 
         except Exception as e:
             logger.error(f"[SummaryService] 分析视频异常: {e}")
-            return None
+            return None, frame_descriptions
     
     async def generate_personalized_reply(
         self,

@@ -216,6 +216,8 @@ class VideoService:
                 "max_retries": self.get_config("analysis.doubao.max_retries", 2),
                 "retry_interval": self.get_config("analysis.doubao.retry_interval", 10),
                 "video_prompt": self.get_config("analysis.doubao.video_prompt", ""),
+                "summary_min_chars": self.get_config("analysis.doubao.summary_min_chars", 100),
+                "summary_max_chars": self.get_config("analysis.doubao.summary_max_chars", 150),
             }
             
             # 动态参数：只有用户配置了才传递
@@ -232,7 +234,8 @@ class VideoService:
             if isinstance(doubao_section, dict):
                 known_params = {
                     "visual_max_duration_min", "api_key", "model_id", "base_url",
-                    "timeout", "max_retries", "retry_interval", "video_prompt"
+                    "timeout", "max_retries", "retry_interval", "video_prompt",
+                    "summary_min_chars", "summary_max_chars"
                 } | set(optional_params)
                 
                 for key, value in doubao_section.items():

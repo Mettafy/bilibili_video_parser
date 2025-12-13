@@ -117,7 +117,7 @@ class BilibiliVideoParserPlugin(BasePlugin):
             "summary_max_chars": ConfigField(
                 type=int,
                 default=200,
-                description="总结最大字数。范围60-6000，小数会自动取整，超出范围使用默认值200"
+                description="总结最大字数。范围60-2000，建议保持默认值200（过长会导致消息被MaiBot截断）"
             ),
         },
         "video": {
@@ -179,6 +179,11 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 type=int,
                 default=10,
                 description="抽帧间隔(秒)，每隔多少秒抽取一帧。系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧）"
+            ),
+            "frame_prompt": ConfigField(
+                type=str,
+                default="",
+                description="自定义帧分析提示词（留空使用默认提示词）"
             ),
         },
         "analysis.builtin": {
@@ -274,16 +279,30 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=10,
                 description="重试间隔时间（秒）"
             ),
+            "summary_min_chars": ConfigField(
+                type=int,
+                default=100,
+                description="豆包视频分析最小字数"
+            ),
+            "summary_max_chars": ConfigField(
+                type=int,
+                default=150,
+                description="豆包视频分析最大字数"
+            ),
             "video_prompt": ConfigField(
                 type=str,
                 default="",
-                description="自定义视频分析提示词（留空使用默认提示词）"
+                description="自定义视频分析提示词（留空使用默认提示词）。提示词中可使用 {summary_min_chars} 和 {summary_max_chars} 占位符"
             ),
         },
     }
 
     def __init__(self, plugin_dir: str, **kwargs):
         super().__init__(plugin_dir, **kwargs)
+        
+        # 读取 plugin.enabled 配置，设置插件启用状态
+        # 注意：必须在 super().__init__() 之后，因为配置系统在父类中初始化
+        self.enable_plugin = self.get_config("plugin.enabled", True)
         
         # 初始化管理器实例（在__init__中初始化，确保get_plugin_components可以使用）
         plugin_path = Path(__file__).parent
@@ -378,6 +397,10 @@ class BilibiliVideoParserPlugin(BasePlugin):
         else:
             # 使用MaiBot VLM（default模式）或不使用VLM（doubao/none模式）
             config["use_builtin"] = False
+            
+            # default模式：读取frame_prompt配置
+            if visual_method == "default":
+                config["frame_prompt"] = self.get_config("analysis.default.frame_prompt", "")
         
         return config
 

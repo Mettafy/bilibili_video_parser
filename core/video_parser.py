@@ -340,13 +340,23 @@ class VideoParser:
     async def extract_audio_text(self, video_path: str) -> Optional[str]:
         """从视频中提取音频并转文字
         
+        注意：此方法已废弃，ASR功能已移至 services/video_service.py 中实现。
+        请使用 VideoService._extract_audio_text() 方法。
+        
+        ASR实现位置：
+        - 音频提取：VideoService._extract_audio() (video_service.py:553)
+        - 语音识别：VideoService._call_voice_model() (video_service.py:601)
+        
+        保留此方法是为了向后兼容，但始终返回None。
+        
         Args:
             video_path: 视频文件路径
             
         Returns:
-            识别的文本
+            始终返回None（请使用VideoService中的ASR功能）
         """
-        # TODO: 实现ASR功能
+        # ASR功能已移至 services/video_service.py 中实现
+        # 请参考 VideoService._extract_audio_text() 方法
         return None
 
     def get_video_duration(self, video_path: str) -> Optional[float]:
