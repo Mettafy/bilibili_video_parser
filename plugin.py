@@ -151,15 +151,20 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=60,
                 description="临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除"
             ),
+            "download_timeout_sec": ConfigField(
+                type=int,
+                default=300,
+                description="视频下载超时时间（秒）。用于从B站下载视频文件，超时后降级到字幕模式或基础信息模式"
+            ),
             "retry_max_attempts": ConfigField(
                 type=int,
                 default=3,
-                description="网络请求最大重试次数"
+                description="B站API请求最大重试次数。用于获取视频信息、字幕、下载地址等B站接口调用"
             ),
             "retry_interval_sec": ConfigField(
                 type=float,
                 default=2.0,
-                description="网络请求重试间隔（秒）"
+                description="B站API请求重试间隔（秒）"
             ),
         },
         "analysis": {
@@ -220,17 +225,17 @@ class BilibiliVideoParserPlugin(BasePlugin):
             "timeout": ConfigField(
                 type=int,
                 default=60,
-                description="请求超时时间（秒）"
+                description="VLM API请求超时时间（秒）。用于帧图片分析请求"
             ),
             "max_retries": ConfigField(
                 type=int,
                 default=2,
-                description="最大重试次数"
+                description="VLM API请求最大重试次数。用于帧图片分析失败后的重试"
             ),
             "retry_interval": ConfigField(
                 type=int,
                 default=5,
-                description="重试间隔时间（秒）"
+                description="VLM API请求重试间隔（秒）"
             ),
             "frame_prompt": ConfigField(
                 type=str,
@@ -267,17 +272,17 @@ class BilibiliVideoParserPlugin(BasePlugin):
             "timeout": ConfigField(
                 type=int,
                 default=120,
-                description="请求超时时间（秒）"
+                description="豆包API请求超时时间（秒）。包含视频上传和分析返回的总时间，建议设置较长"
             ),
             "max_retries": ConfigField(
                 type=int,
                 default=2,
-                description="最大重试次数"
+                description="豆包API请求最大重试次数。用于视频分析失败后的重试"
             ),
             "retry_interval": ConfigField(
                 type=int,
                 default=10,
-                description="重试间隔时间（秒）"
+                description="豆包API请求重试间隔（秒）。豆包服务可能需要较长恢复时间，建议设置较长"
             ),
             "summary_min_chars": ConfigField(
                 type=int,

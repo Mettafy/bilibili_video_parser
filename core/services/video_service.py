@@ -404,28 +404,51 @@ class VideoService:
                 result.visual_method = visual_method
             
             # 步骤3: 下载视频（如果需要视觉分析或ASR，带重试机制）
+            # 采用"尽力获取"策略：下载失败时继续处理，降级到字幕模式或基础信息模式
             if need_visual_analysis or enable_asr:
                 logger.debug(f"[VideoService] 步骤3: 下载视频（视觉分析={need_visual_analysis}, ASR={enable_asr}）...")
-                download_info = await bilibili_api.get_video_download_url(
-                    video_id, sessdata, page,
-                    max_attempts=retry_max_attempts,
-                    retry_interval=retry_interval_sec
-                )
-                if not download_info:
-                    result.error = "获取视频下载地址失败"
-                    return result
                 
-                video_url = download_info['url']
-                result.video_path = await bilibili_api.download_video(
-                    video_url, max_size_mb,
-                    max_attempts=retry_max_attempts,
-                    retry_interval=retry_interval_sec
-                )
+                # 获取下载超时配置
+                download_timeout_sec = self.get_config("video.download_timeout_sec", 300)
+                
+                try:
+                    download_info = await bilibili_api.get_video_download_url(
+                        video_id, sessdata, page,
+                        max_attempts=retry_max_attempts,
+                        retry_interval=retry_interval_sec
+                    )
+                    
+                    if download_info:
+                        video_url = download_info['url']
+                        result.video_path = await bilibili_api.download_video(
+                            video_url, max_size_mb, download_timeout_sec,
+                            max_attempts=retry_max_attempts,
+                            retry_interval=retry_interval_sec
+                        )
+                    else:
+                        logger.warning("[VideoService] 获取视频下载地址失败，降级处理")
+                        result.video_path = None
+                        
+                except NonRetryableError as e:
+                    # 不可重试的错误（如文件过大），记录日志但继续处理
+                    logger.warning(f"[VideoService] 视频下载失败（不可重试）: {e}")
+                    result.video_path = None
+                except Exception as e:
+                    # 其他错误（超时、网络错误等），记录日志但继续处理
+                    logger.warning(f"[VideoService] 视频下载失败: {e}")
+                    result.video_path = None
+                
                 if not result.video_path:
-                    result.error = "视频下载失败"
-                    return result
-                
-                logger.debug(f"[VideoService] 视频下载完成: {result.video_path}")
+                    # 下载失败，降级处理
+                    has_subtitle = bool(result.subtitle_text)
+                    if has_subtitle:
+                        logger.info("[VideoService] 视频下载失败，降级到字幕模式（Level 2）")
+                    else:
+                        logger.info("[VideoService] 视频下载失败，降级到基础信息模式（Level 3）")
+                    result.visual_method = "none"
+                    # 不返回错误，继续处理
+                else:
+                    logger.debug(f"[VideoService] 视频下载完成: {result.video_path}")
             else:
                 logger.debug("[VideoService] 跳过视频下载（不需要视觉分析和ASR）")
             

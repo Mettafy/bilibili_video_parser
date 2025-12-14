@@ -239,9 +239,6 @@ class VideoAnalyzer:
             if result:
                 # 清理响应文本
                 description = result.strip()
-                # 强制截断：最大3000字符（用户可通过自定义提示词控制实际长度）
-                if len(description) > 3000:
-                    description = description[:3000]
                 return description
             return "未识别"
         except Exception as e:
@@ -314,9 +311,6 @@ class VideoAnalyzer:
             if success and response:
                 # 清理响应文本
                 description = response.strip()
-                # 强制截断：最大3000字符（用户可通过自定义提示词控制实际长度）
-                if len(description) > 3000:
-                    description = description[:3000]
                 return description
             else:
                 logger.warning(f"[VideoAnalyzer] VLM分析失败: {response}")
@@ -390,13 +384,9 @@ class VideoAnalyzer:
             # 构建帧描述
             frames_block = "\n".join(frame_descriptions) if frame_descriptions else "无帧描述"
             
-            # 构建字幕块
+            # 构建字幕块（不截断，保留完整内容）
             subtitle_block = ""
             if subtitle_text:
-                # 限制字幕长度
-                max_subtitle_len = 800
-                if len(subtitle_text) > max_subtitle_len:
-                    subtitle_text = subtitle_text[:max_subtitle_len] + "..."
                 subtitle_block = f"\n\n视频字幕内容:\n{subtitle_text}"
             
             # 构建最终提示词 - 直接输出总结内容，不要任何说明或格式标记

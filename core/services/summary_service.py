@@ -312,12 +312,9 @@ class SummaryService:
                     description = description[:max_desc_len] + "..."
                 description_block = f"\n\n视频简介:\n{description}"
             
-            # 构建字幕/ASR块
+            # 构建字幕/ASR块（不截断，保留完整内容）
             text_block = ""
             if text_content:
-                max_text_len = 800
-                if len(text_content) > max_text_len:
-                    text_content = text_content[:max_text_len] + "..."
                 text_block = f"\n\n视频字幕/语音内容:\n{text_content}"
             
             # 获取总结字数配置
@@ -407,12 +404,9 @@ class SummaryService:
                     description = description[:max_desc_len] + "..."
                 description_block = f"\n\n视频简介:\n{description}"
             
-            # 构建字幕/ASR块
+            # 构建字幕/ASR块（不截断，保留完整内容）
             text_block = ""
             if text_content:
-                max_text_len = 1200  # 纯文本模式允许更长的字幕
-                if len(text_content) > max_text_len:
-                    text_content = text_content[:max_text_len] + "..."
                 text_block = f"\n\n视频字幕/语音内容:\n{text_content}"
             
             # 如果没有任何文本内容，只能基于标题和简介
@@ -546,12 +540,9 @@ class SummaryService:
             # 构建帧描述
             frames_block = "\n".join(frame_descriptions) if frame_descriptions else "无帧描述"
             
-            # 构建字幕/ASR块
+            # 构建字幕/ASR块（不截断，保留完整内容）
             text_block = ""
             if text_content:
-                max_text_len = 800
-                if len(text_content) > max_text_len:
-                    text_content = text_content[:max_text_len] + "..."
                 text_block = f"\n\n视频字幕/语音内容:\n{text_content}"
             
             # 获取总结字数配置

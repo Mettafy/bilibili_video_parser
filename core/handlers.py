@@ -284,6 +284,40 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
                 'total_pages': process_result.total_pages,
             }
             
+            # 判断降级级别
+            # Level 1: 有视觉分析（帧或豆包）
+            # Level 2: 无视觉分析，有字幕/ASR
+            # Level 3: 无视觉分析，无字幕/ASR（只有基础信息）
+            has_visual = bool(process_result.frame_paths) or bool(process_result.visual_analysis)
+            has_text = bool(process_result.subtitle_text) or bool(process_result.asr_text)
+            
+            if not has_visual and not has_text:
+                # Level 3: 基础信息模式 - 不调用LLM，直接构建基础信息
+                logger.info("[BilibiliAutoDetect] Level 3: 基础信息模式（不调用LLM）")
+                video_info_text = self._build_basic_info_text(
+                    title=process_result.title,
+                    author=process_result.author,
+                    description=process_result.description,
+                    duration=process_result.duration,
+                    page=process_result.page,
+                    page_title=process_result.page_title,
+                    total_pages=process_result.total_pages,
+                    total_duration=process_result.total_duration
+                )
+                # 简化原始消息中的B站链接
+                simplified_text = self._simplify_bilibili_links(message.plain_text, video_id)
+                new_text = f"{simplified_text}\n\n{video_info_text}"
+                message.modify_plain_text(new_text)
+                
+                # Level 3 不缓存（因为没有分析内容，下次可能网络恢复能获取更多信息）
+                return message
+            
+            # Level 1 或 Level 2: 需要生成总结
+            if has_visual:
+                logger.debug("[BilibiliAutoDetect] Level 1: 完整模式")
+            else:
+                logger.debug("[BilibiliAutoDetect] Level 2: 字幕模式")
+            
             # 步骤2: 生成总结（帧分析在 summary_service 内部进行，避免重复分析）
             # 注意：帧分析只在 summary_service.generate_summary() 内部进行
             # handlers.py 不应进行帧分析，这是职责分离的关键
@@ -460,6 +494,77 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
             parts.append(f"简介：{description}")
         
         parts.append(f"内容总结：{summary}")
+        
+        return "\n".join(parts)
+    
+    def _build_basic_info_text(
+        self,
+        title: str,
+        author: str,
+        description: str,
+        duration: int = None,
+        page: int = 1,
+        page_title: str = "",
+        total_pages: int = 1,
+        total_duration: int = None
+    ) -> str:
+        """构建基础信息文本（Level 3 降级模式使用）
+        
+        不包含总结，只包含视频的基础元信息，
+        发送给主回复系统让其自行决定如何回复。
+        
+        与 _build_video_info_text 的区别：
+        - 不包含"内容总结"字段
+        - 添加降级提示说明
+        
+        Args:
+            title: 视频标题
+            author: UP主名称
+            description: 视频简介
+            duration: 当前分P时长（秒）
+            page: 分P号
+            page_title: 分P标题
+            total_pages: 总分P数
+            total_duration: 合集总时长（秒）
+            
+        Returns:
+            格式化的基础信息文本
+        """
+        # 构建标题（包含分P信息）
+        if total_pages > 1:
+            if page_title:
+                title_text = f"关于这个B站视频《{title}》P{page}「{page_title}」："
+            else:
+                title_text = f"关于这个B站视频《{title}》P{page}："
+        else:
+            title_text = f"关于这个B站视频《{title}》："
+        
+        parts = [title_text]
+        
+        if author:
+            parts.append(f"UP主：{author}")
+        
+        # 时长显示逻辑
+        if total_pages > 1:
+            # 多P视频：显示当前分P时长和合集总时长
+            if duration:
+                parts.append(f"当前分P时长：{self._format_duration(duration)}")
+            if total_duration:
+                parts.append(f"合集总时长：{self._format_duration(total_duration)}（共{total_pages}P）")
+        else:
+            # 单P视频：只显示时长
+            if duration:
+                parts.append(f"时长：{self._format_duration(duration)}")
+        
+        if description:
+            # Level 3 可以显示更长的简介，因为没有总结
+            max_desc_len = 400
+            if len(description) > max_desc_len:
+                description = description[:max_desc_len] + "..."
+            parts.append(f"简介：{description}")
+        
+        # 添加降级说明（让主回复系统知道这是基础信息）
+        parts.append("（视频内容暂时无法解析，以上为基础信息）")
         
         return "\n".join(parts)
     
@@ -746,6 +851,52 @@ class BilibiliCommandHandler(BaseCommand):
                 'total_pages': video_total_pages,
             }
             
+            # 判断降级级别
+            # Level 1: 有视觉分析（帧或豆包）
+            # Level 2: 无视觉分析，有字幕/ASR
+            # Level 3: 无视觉分析，无字幕/ASR（只有基础信息）
+            has_visual = bool(raw_info.get('frame_descriptions')) or bool(raw_info.get('visual_analysis'))
+            has_text = bool(raw_info.get('subtitle_text')) or bool(raw_info.get('asr_text'))
+            
+            if not has_visual and not has_text:
+                # Level 3: 基础信息模式 - 不调用LLM，直接发送基础信息
+                logger.info("[BilibiliCommand] Level 3: 基础信息模式（不调用LLM）")
+                
+                basic_info_text = self._build_basic_info_text(
+                    title=video_title,
+                    author=video_author,
+                    description=video_description,
+                    duration=video_duration,
+                    page=video_page,
+                    page_title=video_page_title,
+                    total_pages=video_total_pages,
+                    total_duration=video_total_duration
+                )
+                
+                # 将MessageRecv转换为DatabaseMessages用于引用回复
+                reply_message = self._message_recv_to_database_messages()
+                
+                # 发送基础信息给用户
+                await self.send_text(
+                    basic_info_text,
+                    set_reply=True,
+                    reply_message=reply_message
+                )
+                
+                # 修改消息内容，让replyer可见
+                original_text = self.message.processed_plain_text
+                simplified_text = self._simplify_bilibili_links(original_text, video_id)
+                self.message.processed_plain_text = f"{simplified_text}\n\n{basic_info_text}"
+                
+                logger.info(f"[BilibiliCommand] 视频基础信息发送完成: {video_title}")
+                return True, None, 1
+            
+            # Level 1 或 Level 2: 需要生成个性化回复
+            if has_visual:
+                logger.debug("[BilibiliCommand] Level 1: 完整模式")
+            else:
+                logger.debug("[BilibiliCommand] Level 2: 字幕模式")
+            
             # 根据enable_summary配置决定是否生成总结
             if enable_summary:
                 # 启用总结模式：先生成总结，再基于总结生成个性化回复
@@ -962,6 +1113,100 @@ class BilibiliCommandHandler(BaseCommand):
         except Exception as e:
             logger.error(f"[BilibiliCommand] 转换消息对象失败: {e}")
             return None
+    
+    def _build_basic_info_text(
+        self,
+        title: str,
+        author: str,
+        description: str,
+        duration: int = None,
+        page: int = 1,
+        page_title: str = "",
+        total_pages: int = 1,
+        total_duration: int = None
+    ) -> str:
+        """构建基础信息文本（Level 3 降级模式使用）
+        
+        不包含总结，只包含视频的基础元信息，
+        发送给用户和主回复系统。
+        
+        Args:
+            title: 视频标题
+            author: UP主名称
+            description: 视频简介
+            duration: 当前分P时长（秒）
+            page: 分P号
+            page_title: 分P标题
+            total_pages: 总分P数
+            total_duration: 合集总时长（秒）
+            
+        Returns:
+            格式化的基础信息文本
+        """
+        # 构建标题（包含分P信息）
+        if total_pages > 1:
+            if page_title:
+                title_text = f"关于这个B站视频《{title}》P{page}「{page_title}」："
+            else:
+                title_text = f"关于这个B站视频《{title}》P{page}："
+        else:
+            title_text = f"关于这个B站视频《{title}》："
+        
+        parts = [title_text]
+        
+        if author:
+            parts.append(f"UP主：{author}")
+        
+        # 时长显示逻辑
+        if total_pages > 1:
+            # 多P视频：显示当前分P时长和合集总时长
+            if duration:
+                parts.append(f"当前分P时长：{self._format_duration(duration)}")
+            if total_duration:
+                parts.append(f"合集总时长：{self._format_duration(total_duration)}（共{total_pages}P）")
+        else:
+            # 单P视频：只显示时长
+            if duration:
+                parts.append(f"时长：{self._format_duration(duration)}")
+        
+        if description:
+            # Level 3 可以显示更长的简介，因为没有总结
+            max_desc_len = 400
+            if len(description) > max_desc_len:
+                description = description[:max_desc_len] + "..."
+            parts.append(f"简介：{description}")
+        
+        # 添加降级说明
+        parts.append("（视频内容暂时无法解析，以上为基础信息）")
+        
+        return "\n".join(parts)
+    
+    def _format_duration(self, seconds: int) -> str:
+        """格式化时长为用户友好的字符串
+        
+        Args:
+            seconds: 秒数
+            
+        Returns:
+            格式化的时长字符串，如"4小时2分钟"、"48分钟"、"30秒"
+        """
+        if seconds < 60:
+            return f"{seconds}秒"
+        
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        
+        parts = []
+        if hours > 0:
+            parts.append(f"{hours}小时")
+        if minutes > 0:
+            parts.append(f"{minutes}分钟")
+        # 只有在没有小时和分钟时才显示秒
+        if not parts and secs > 0:
+            parts.append(f"{secs}秒")
+        
+        return "".join(parts) if parts else "0秒"
     
     def _get_friendly_error_message(self, error: Optional[str]) -> str:
         """根据错误信息返回友好的错误提示

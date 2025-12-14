@@ -585,6 +585,7 @@ class BilibiliAPI:
     async def download_video(
         url: str,
         max_size_mb: int = 100,
+        timeout_sec: int = 300,
         max_attempts: int = None,
         retry_interval: float = None,
     ) -> Optional[str]:
@@ -593,6 +594,7 @@ class BilibiliAPI:
         Args:
             url: 视频下载地址
             max_size_mb: 最大文件大小(MB)
+            timeout_sec: 下载超时时间（秒），默认300秒
             max_attempts: 最大重试次数
             retry_interval: 重试间隔（秒）
             
@@ -622,7 +624,7 @@ class BilibiliAPI:
         async def _download():
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as response:
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as response:
                         if response.status != 200:
                             error_type, retryable = classify_http_error(response.status)
                             
