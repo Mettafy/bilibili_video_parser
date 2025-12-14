@@ -172,9 +172,11 @@ class DoubaoAnalyzer:
             video_preprocess_config["fps"] = self.config["fps"]
         
         # 已知的非API参数（不应传递给API）
+        # 这些参数用于本地处理，不应传递给豆包API
         non_api_params = {
             "api_key", "model_id", "base_url", "timeout", "max_retries",
-            "retry_interval", "video_prompt", "visual_max_duration_min"
+            "retry_interval", "video_prompt", "visual_max_duration_min",
+            "summary_min_chars", "summary_max_chars"  # 用于格式化提示词，不传递给API
         }
         
         # 构建动态API参数
