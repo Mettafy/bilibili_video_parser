@@ -61,6 +61,7 @@
 
    ```bash
    #### 首先进入 MaiBot 的虚拟环境
+
    # Windows:
    cd MaiBot目录
    .venv\Scripts\activate
@@ -71,6 +72,8 @@
    
    # 然后安装插件依赖
    pip install -r plugins/bilibili_video_parser/requirements.txt
+
+   # 一键包，双击打开[点我启动.bat]控制台，使用 交互式安装依赖 选项即可。
    ```
 
 3. 确保系统已安装 ffmpeg
@@ -84,6 +87,7 @@
 ## 使用方法
 
 > ✅ 支持 B站视频链接、BV/AV 号，以及 QQ 中分享的 B站小程序卡片（需适配器为最新版本）。
+
 
 ### 自动检测模式
 
@@ -213,6 +217,8 @@ ffmpeg_path = "C:\\tools\\ffmpeg\\bin"
 | `lock_max_frames_5` | bool | `true` | 是否锁定为固定等距抽5帧。`true`：固定等距抽5帧（最多5帧）；`false`：按视频时长和 `frame_interval_sec` 动态计算等距抽帧；若时长未知则降级到固定5帧逻辑 |
 | `frame_interval_sec` | int | `10` | 抽帧间隔（秒）。仅在 `lock_max_frames_5=false` 时生效，用于按视频时长动态计算等距抽帧数量 |
 | `frame_prompt` | string | `""` | 自定义帧分析提示词，留空使用默认提示词 |
+| `parallel_frame_analysis` | bool | `false` | 是否启用并发关键帧识别。`false` 时严格逐帧串行；`true` 时启用并发（并发数由 `parallel_frame_analysis_limit` 控制） |
+| `parallel_frame_analysis_limit` | int | `2` | 并发关键帧识别的最大并发数。**仅在 `parallel_frame_analysis=true` 时生效**。建议范围 1-5，值越大越快但更容易触发模型/服务限流 |
 
 > ⚠️ **关于 frame_prompt 的说明**：
 >
@@ -240,6 +246,8 @@ ffmpeg_path = "C:\\tools\\ffmpeg\\bin"
 | `max_retries` | int | `2` | VLM API请求最大重试次数。用于帧图片分析失败后的重试 |
 | `retry_interval` | int | `5` | VLM API请求重试间隔（秒） |
 | `frame_prompt` | string | `""` | 自定义帧分析提示词，留空使用默认提示词 |
+| `parallel_frame_analysis` | bool | `false` | 是否启用并发关键帧识别。`false` 时严格逐帧串行；`true` 时启用并发（并发数由 `parallel_frame_analysis_limit` 控制） |
+| `parallel_frame_analysis_limit` | int | `2` | 并发关键帧识别的最大并发数。**仅在 `parallel_frame_analysis=true` 时生效**。建议范围 1-5，值越大越快但更容易触发模型/服务限流 |
 
 **动态参数说明**：builtin模式支持动态参数传递，您可以根据API服务商的要求添加额外参数，如 `temperature`、`max_tokens`、`top_p` 等。只有您在配置文件中实际定义的参数才会被传递给API。
 
