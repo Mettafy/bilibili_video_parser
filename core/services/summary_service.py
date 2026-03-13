@@ -75,9 +75,11 @@ SummaryResult 字段：
 
 Author: 约瑟夫.k && 白泽
 """
+import asyncio
 from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass, field
 from src.plugin_system import llm_api, get_logger
+from .text_format_service import format_duration
 
 logger = get_logger("summary_service")
 
@@ -232,7 +234,8 @@ class SummaryService:
                     author=author,
                     duration=duration,
                     video_id=video_id,
-                    text_content=text_content
+                    text_content=text_content,
+                    visual_method=visual_method,
                 )
                 # 保存帧描述到结果中，供调用方用于缓存
                 result.frame_descriptions = frame_descriptions
@@ -453,6 +456,37 @@ class SummaryService:
             logger.error(f"[SummaryService] 纯文本模式总结异常: {e}")
             return None
     
+    def _get_parallel_frame_analysis_config(self, visual_method: str) -> tuple[bool, int]:
+        """读取并发帧识别配置（仅对 default/builtin 生效）
+
+        Returns:
+            tuple[bool, int]: (enable_parallel, max_concurrency)
+            - enable_parallel=False 时，max_concurrency 固定返回 1（表示串行）
+        """
+        if visual_method not in ("default", "builtin"):
+            return False, 1
+
+        enable = bool(self.get_config(f"analysis.{visual_method}.parallel_frame_analysis", False))
+        if not enable:
+            # 关闭时严格保持旧逻辑：逐帧串行
+            return False, 1
+
+        # 仅 enable=True 时才读取并发上限
+        default_limit = 2
+        try:
+            limit = self.get_config(
+                f"analysis.{visual_method}.parallel_frame_analysis_limit", default_limit
+            )
+            if isinstance(limit, float):
+                limit = int(limit)
+            if not isinstance(limit, int):
+                limit = default_limit
+            # 合理范围：1-5
+            limit = max(1, min(5, limit))
+            return True, limit
+        except Exception:
+            return True, default_limit
+
     async def _analyze_video_with_description(
         self,
         frame_paths: List[str],
@@ -461,7 +495,8 @@ class SummaryService:
         author: str,
         duration: Optional[int],
         video_id: str,
-        text_content: Optional[str]
+        text_content: Optional[str],
+        visual_method: str = "default",
     ) -> tuple[Optional[str], List[str]]:
         """分析视频并生成总结（支持视频简介和作者信息）
         
@@ -496,23 +531,80 @@ class SummaryService:
         logger.debug(f"[SummaryService] 开始VLM帧分析: {len(frame_paths)} 帧")
         
         # 帧描述列表，用于返回给调用方缓存
-        frame_descriptions = []
-        
+        frame_descriptions: List[str] = []
+
         try:
             # 第一步：分析关键帧，获取每帧的描述
             # 硬编码限制：最多分析5帧，避免过多API调用
             MAX_ANALYZE_FRAMES = 5  # 硬编码：最大VLM分析帧数
             max_analyze_frames = min(len(frame_paths), MAX_ANALYZE_FRAMES)
             logger.debug(f"[SummaryService] 将分析 {max_analyze_frames} 帧")
-            
-            for idx, frame_path in enumerate(frame_paths[:max_analyze_frames], start=1):
-                logger.debug(f"[SummaryService] 分析第 {idx}/{max_analyze_frames} 帧")
-                desc = await self.video_analyzer.analyze_frame(frame_path)
-                if desc and desc != "未识别":
-                    frame_descriptions.append(f"帧{idx}: {desc}")
-                else:
-                    frame_descriptions.append(f"帧{idx}: 画面内容未识别")
-            
+
+            enable_parallel, max_concurrency = self._get_parallel_frame_analysis_config(visual_method)
+            logger.debug(
+                f"[SummaryService] 并发帧识别: enable={enable_parallel}, max_concurrency={max_concurrency}"
+            )
+
+            # 逐帧识别：失败帧直接跳过（不输出'未识别'占位，避免误导总结模型）
+            async def _analyze_one(idx: int, frame_path: str):
+                if enable_parallel:
+                    async with sem:
+                        return await _do_call(idx, frame_path)
+                return await _do_call(idx, frame_path)
+
+            async def _do_call(idx: int, frame_path: str):
+                try:
+                    desc = await self.video_analyzer.analyze_frame(frame_path)
+                    if desc and desc != "未识别":
+                        return idx, str(desc).strip()
+                    return None
+                except Exception as e:
+                    logger.warning(f"[SummaryService] 帧识别失败 idx={idx}: {e}")
+                    return None
+
+            sem = asyncio.Semaphore(max(1, min(max_concurrency, max_analyze_frames)))
+
+            if enable_parallel:
+                tasks = [
+                    asyncio.create_task(_analyze_one(idx, p))
+                    for idx, p in enumerate(frame_paths[:max_analyze_frames], start=1)
+                ]
+                results = await asyncio.gather(*tasks)
+                # 按帧序号汇总，确保顺序稳定
+                by_idx: Dict[int, str] = {}
+                for item in results:
+                    if not item:
+                        continue
+                    i, d = item
+                    if isinstance(i, int) and isinstance(d, str) and d.strip():
+                        by_idx[i] = d.strip()
+                for idx in range(1, max_analyze_frames + 1):
+                    if idx in by_idx:
+                        frame_descriptions.append(f"帧{idx}: {by_idx[idx]}")
+            else:
+                # 关闭并发：严格串行（旧逻辑），但失败帧直接跳过
+                for idx, frame_path in enumerate(frame_paths[:max_analyze_frames], start=1):
+                    logger.debug(f"[SummaryService] 分析第 {idx}/{max_analyze_frames} 帧")
+                    try:
+                        desc = await self.video_analyzer.analyze_frame(frame_path)
+                    except Exception as e:
+                        logger.warning(f"[SummaryService] 帧识别失败 idx={idx}: {e}")
+                        continue
+                    if desc and desc != "未识别":
+                        frame_descriptions.append(f"帧{idx}: {str(desc).strip()}")
+
+            # 全部失败：回退纯文本总结，避免给总结模型喂“无帧描述”造成飘逸
+            if not frame_descriptions:
+                logger.warning("[SummaryService] 所有关键帧识别失败，回退到纯文本总结")
+                summary = await self._generate_summary_text_only(
+                    title=title,
+                    description=description,
+                    author=author,
+                    duration=duration,
+                    text_content=text_content,
+                )
+                return summary, []
+
             # 第二步：构建最终总结提示词
             # 构建元信息
             meta_parts = [f"视频标题: {title}"]
@@ -525,6 +617,7 @@ class SummaryService:
                     meta_parts.append(f"时长: {minutes}分{seconds}秒")
                 else:
                     meta_parts.append(f"时长: {seconds}秒")
+            # 分析帧数按“成功帧描述条数”统计
             meta_parts.append(f"分析帧数: {len(frame_descriptions)}")
             meta_block = "\n".join(meta_parts)
             
@@ -847,31 +940,8 @@ class SummaryService:
             return None
     
     def _format_duration(self, seconds: int) -> str:
-        """格式化时长为用户友好的字符串
-        
-        Args:
-            seconds: 秒数
-            
-        Returns:
-            格式化的时长字符串，如"4小时2分钟"、"48分钟"、"30秒"
-        """
-        if seconds < 60:
-            return f"{seconds}秒"
-        
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-        
-        parts = []
-        if hours > 0:
-            parts.append(f"{hours}小时")
-        if minutes > 0:
-            parts.append(f"{minutes}分钟")
-        # 只有在没有小时和分钟时才显示秒
-        if not parts and secs > 0:
-            parts.append(f"{secs}秒")
-        
-        return "".join(parts) if parts else "0秒"
+        """格式化时长为用户友好的字符串。"""
+        return format_duration(seconds)
     
     def build_raw_info_text(
         self,

@@ -92,7 +92,7 @@ ERROR_MESSAGES = {
     ErrorType.VIDEO_TOO_LARGE: "视频文件过大（>{limit}MB）",
     ErrorType.NETWORK_ERROR: "网络连接失败，请稍后重试",
     ErrorType.NO_CONTENT: "无法获取视频内容",
-    ErrorType.PERMISSION_DENIED: "视频需要登录或会员才能观看",
+    ErrorType.PERMISSION_DENIED: "访问受限（可能触发风控或需要登录/会员）",
     ErrorType.RATE_LIMITED: "请求过于频繁，请稍后重试",
     ErrorType.UNKNOWN: "视频解析失败",
 }

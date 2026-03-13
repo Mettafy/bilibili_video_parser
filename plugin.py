@@ -87,7 +87,7 @@ class BilibiliVideoParserPlugin(BasePlugin):
         "plugin": {
             "config_version": ConfigField(
                 type=str,
-                default="3.1.0",
+                default="3.2.0",
                 description="配置文件版本"
             ),
             "enabled": ConfigField(
@@ -136,6 +136,11 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default="",
                 description="B站SESSDATA Cookie（可选，用于获取字幕）。不填写时将跳过字幕获取"
             ),
+            "ffmpeg_path": ConfigField(
+                type=str,
+                default="",
+                description="ffmpeg路径（可选）。Windows 可填写 ffmpeg 的 bin 目录或 ffmpeg(.exe) 完整路径；留空时自动从系统 PATH 检测"
+            ),
             "enable_asr": ConfigField(
                 type=bool,
                 default=False,
@@ -180,15 +185,30 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=10.0,
                 description="进行视觉分析的最大视频时长(分钟)。超过此时长的视频将只使用字幕+ASR+视频信息，不进行视觉分析"
             ),
+            "lock_max_frames_5": ConfigField(
+                type=bool,
+                default=True,
+                description="是否锁定为固定等距抽5帧。true时固定等距抽5帧（最多5帧）；false时按frame_interval_sec动态计算等距抽帧；若时长未知则降级到固定5帧逻辑"
+            ),
             "frame_interval_sec": ConfigField(
                 type=int,
                 default=10,
-                description="抽帧间隔(秒)，每隔多少秒抽取一帧。系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧）"
+                description="抽帧间隔(秒)。仅在lock_max_frames_5=false时生效，用于按视频时长动态计算等距抽帧数量"
             ),
             "frame_prompt": ConfigField(
                 type=str,
                 default="",
                 description="自定义帧分析提示词（留空使用默认提示词）"
+            ),
+            "parallel_frame_analysis": ConfigField(
+                type=bool,
+                default=False,
+                description="是否并发进行关键帧识别。false时保持旧逻辑：逐帧串行识别；true时启用并发（受parallel_frame_analysis_limit限制）"
+            ),
+            "parallel_frame_analysis_limit": ConfigField(
+                type=int,
+                default=2,
+                description="并发关键帧识别的最大并发数（仅parallel_frame_analysis=true时生效）。建议1-5，值越大速度越快但更容易触发模型/服务限流"
             ),
         },
         "analysis.builtin": {
@@ -197,10 +217,15 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 default=10.0,
                 description="进行视觉分析的最大视频时长(分钟)。超过此时长的视频将只使用字幕+ASR+视频信息，不进行视觉分析"
             ),
+            "lock_max_frames_5": ConfigField(
+                type=bool,
+                default=True,
+                description="是否锁定为固定等距抽5帧。true时固定等距抽5帧（最多5帧）；false时按frame_interval_sec动态计算等距抽帧；若时长未知则降级到固定5帧逻辑"
+            ),
             "frame_interval_sec": ConfigField(
                 type=int,
                 default=10,
-                description="抽帧间隔(秒)，每隔多少秒抽取一帧。系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧）"
+                description="抽帧间隔(秒)。仅在lock_max_frames_5=false时生效，用于按视频时长动态计算等距抽帧数量"
             ),
             "client_type": ConfigField(
                 type=str,
@@ -241,6 +266,16 @@ class BilibiliVideoParserPlugin(BasePlugin):
                 type=str,
                 default="",
                 description="自定义帧分析提示词（留空使用默认提示词）"
+            ),
+            "parallel_frame_analysis": ConfigField(
+                type=bool,
+                default=False,
+                description="是否并发进行关键帧识别。false时保持旧逻辑：逐帧串行识别；true时启用并发（受parallel_frame_analysis_limit限制）"
+            ),
+            "parallel_frame_analysis_limit": ConfigField(
+                type=int,
+                default=2,
+                description="并发关键帧识别的最大并发数（仅parallel_frame_analysis=true时生效）。建议1-5，值越大速度越快但更容易触发模型/服务限流"
             ),
         },
         "analysis.doubao": {
@@ -327,7 +362,17 @@ class BilibiliVideoParserPlugin(BasePlugin):
         init_temp_dir(str(data_dir))
         
         self.cache_manager = CacheManager(str(data_dir))
-        self.video_parser = VideoParser(data_dir=str(data_dir))
+
+        ffmpeg_path = self.get_config("video.ffmpeg_path", "")
+        if isinstance(ffmpeg_path, str):
+            ffmpeg_path = ffmpeg_path.strip()
+        else:
+            ffmpeg_path = ""
+
+        self.video_parser = VideoParser(
+            ffmpeg_path=ffmpeg_path or None,
+            data_dir=str(data_dir)
+        )
         
         # 获取VLM配置（根据visual_method决定使用哪个配置）
         vlm_config = self._get_vlm_config()
@@ -390,7 +435,7 @@ class BilibiliVideoParserPlugin(BasePlugin):
             builtin_config = self.get_config("analysis.builtin", {})
             if isinstance(builtin_config, dict):
                 known_params = {
-                    "visual_max_duration_min", "frame_interval_sec", "client_type",
+                    "visual_max_duration_min", "frame_interval_sec", "lock_max_frames_5", "client_type",
                     "base_url", "api_key", "model", "timeout", "max_retries",
                     "retry_interval", "frame_prompt"
                 } | set(optional_params)

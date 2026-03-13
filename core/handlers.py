@@ -51,7 +51,6 @@
 
 Author: 约瑟夫.k && 白泽
 """
-import re
 from typing import Tuple, Optional, TYPE_CHECKING
 from src.plugin_system import (
     BaseEventHandler,
@@ -69,6 +68,11 @@ from .video_parser import VideoParser
 from .video_analyzer import VideoAnalyzer
 from .services.video_service import VideoService
 from .services.summary_service import SummaryService
+from .services.text_format_service import (
+    build_basic_info_text,
+    format_duration,
+    simplify_bilibili_links,
+)
 from .retry_utils import (
     ErrorType,
     NonRetryableError,
@@ -508,117 +512,25 @@ class BilibiliAutoDetectHandler(BaseEventHandler):
         total_pages: int = 1,
         total_duration: int = None
     ) -> str:
-        """构建基础信息文本（Level 3 降级模式使用）
-        
-        不包含总结，只包含视频的基础元信息，
-        发送给主回复系统让其自行决定如何回复。
-        
-        与 _build_video_info_text 的区别：
-        - 不包含"内容总结"字段
-        - 添加降级提示说明
-        
-        Args:
-            title: 视频标题
-            author: UP主名称
-            description: 视频简介
-            duration: 当前分P时长（秒）
-            page: 分P号
-            page_title: 分P标题
-            total_pages: 总分P数
-            total_duration: 合集总时长（秒）
-            
-        Returns:
-            格式化的基础信息文本
-        """
-        # 构建标题（包含分P信息）
-        if total_pages > 1:
-            if page_title:
-                title_text = f"关于这个B站视频《{title}》P{page}「{page_title}」："
-            else:
-                title_text = f"关于这个B站视频《{title}》P{page}："
-        else:
-            title_text = f"关于这个B站视频《{title}》："
-        
-        parts = [title_text]
-        
-        if author:
-            parts.append(f"UP主：{author}")
-        
-        # 时长显示逻辑
-        if total_pages > 1:
-            # 多P视频：显示当前分P时长和合集总时长
-            if duration:
-                parts.append(f"当前分P时长：{self._format_duration(duration)}")
-            if total_duration:
-                parts.append(f"合集总时长：{self._format_duration(total_duration)}（共{total_pages}P）")
-        else:
-            # 单P视频：只显示时长
-            if duration:
-                parts.append(f"时长：{self._format_duration(duration)}")
-        
-        if description:
-            # Level 3 可以显示更长的简介，因为没有总结
-            max_desc_len = 400
-            if len(description) > max_desc_len:
-                description = description[:max_desc_len] + "..."
-            parts.append(f"简介：{description}")
-        
-        # 添加降级说明（让主回复系统知道这是基础信息）
-        parts.append("（视频内容暂时无法解析，以上为基础信息）")
-        
-        return "\n".join(parts)
+        """构建基础信息文本（Level 3 降级模式使用）。"""
+        return build_basic_info_text(
+            title=title,
+            author=author,
+            description=description,
+            duration=duration,
+            page=page,
+            page_title=page_title,
+            total_pages=total_pages,
+            total_duration=total_duration,
+        )
     
     def _format_duration(self, seconds: int) -> str:
-        """格式化时长为用户友好的字符串
-        
-        Args:
-            seconds: 秒数
-            
-        Returns:
-            格式化的时长字符串，如"4小时2分钟"、"48分钟"、"30秒"
-        """
-        if seconds < 60:
-            return f"{seconds}秒"
-        
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-        
-        parts = []
-        if hours > 0:
-            parts.append(f"{hours}小时")
-        if minutes > 0:
-            parts.append(f"{minutes}分钟")
-        # 只有在没有小时和分钟时才显示秒
-        if not parts and secs > 0:
-            parts.append(f"{secs}秒")
-        
-        return "".join(parts) if parts else "0秒"
+        """格式化时长为用户友好的字符串。"""
+        return format_duration(seconds)
     
     def _simplify_bilibili_links(self, text: str, video_id: str) -> str:
-        """简化消息中的B站链接，减少消息长度
-        
-        将长链接替换为简化的视频ID，避免消息过长被截断
-        
-        Args:
-            text: 原始消息文本
-            video_id: 已解析的视频ID（BV号或AV号）
-            
-        Returns:
-            简化后的消息文本
-        """
-        # 替换完整B站链接（包含各种参数）为视频ID
-        # 匹配: https://www.bilibili.com/video/BVxxx?各种参数
-        # 匹配: https://m.bilibili.com/video/BVxxx?各种参数
-        bilibili_url_pattern = r'https?://(?:www\.|m\.)?bilibili\.com/video/(?:BV[a-zA-Z0-9]{10}|av\d+)[^\s]*'
-        text = re.sub(bilibili_url_pattern, video_id, text)
-        
-        # 替换b23.tv短链接（包含各种参数）为简化形式
-        # 匹配: https://b23.tv/xxx?各种参数
-        short_url_pattern = r'https?://b23\.tv/([a-zA-Z0-9]+)[^\s]*'
-        text = re.sub(short_url_pattern, rf'b23.tv/\1', text)
-        
-        return text
+        """简化消息中的B站链接并清理图片标记，减少消息长度。"""
+        return simplify_bilibili_links(text, video_id)
 
 
 class BilibiliCommandHandler(BaseCommand):
@@ -1125,88 +1037,21 @@ class BilibiliCommandHandler(BaseCommand):
         total_pages: int = 1,
         total_duration: int = None
     ) -> str:
-        """构建基础信息文本（Level 3 降级模式使用）
-        
-        不包含总结，只包含视频的基础元信息，
-        发送给用户和主回复系统。
-        
-        Args:
-            title: 视频标题
-            author: UP主名称
-            description: 视频简介
-            duration: 当前分P时长（秒）
-            page: 分P号
-            page_title: 分P标题
-            total_pages: 总分P数
-            total_duration: 合集总时长（秒）
-            
-        Returns:
-            格式化的基础信息文本
-        """
-        # 构建标题（包含分P信息）
-        if total_pages > 1:
-            if page_title:
-                title_text = f"关于这个B站视频《{title}》P{page}「{page_title}」："
-            else:
-                title_text = f"关于这个B站视频《{title}》P{page}："
-        else:
-            title_text = f"关于这个B站视频《{title}》："
-        
-        parts = [title_text]
-        
-        if author:
-            parts.append(f"UP主：{author}")
-        
-        # 时长显示逻辑
-        if total_pages > 1:
-            # 多P视频：显示当前分P时长和合集总时长
-            if duration:
-                parts.append(f"当前分P时长：{self._format_duration(duration)}")
-            if total_duration:
-                parts.append(f"合集总时长：{self._format_duration(total_duration)}（共{total_pages}P）")
-        else:
-            # 单P视频：只显示时长
-            if duration:
-                parts.append(f"时长：{self._format_duration(duration)}")
-        
-        if description:
-            # Level 3 可以显示更长的简介，因为没有总结
-            max_desc_len = 400
-            if len(description) > max_desc_len:
-                description = description[:max_desc_len] + "..."
-            parts.append(f"简介：{description}")
-        
-        # 添加降级说明
-        parts.append("（视频内容暂时无法解析，以上为基础信息）")
-        
-        return "\n".join(parts)
+        """构建基础信息文本（Level 3 降级模式使用）。"""
+        return build_basic_info_text(
+            title=title,
+            author=author,
+            description=description,
+            duration=duration,
+            page=page,
+            page_title=page_title,
+            total_pages=total_pages,
+            total_duration=total_duration,
+        )
     
     def _format_duration(self, seconds: int) -> str:
-        """格式化时长为用户友好的字符串
-        
-        Args:
-            seconds: 秒数
-            
-        Returns:
-            格式化的时长字符串，如"4小时2分钟"、"48分钟"、"30秒"
-        """
-        if seconds < 60:
-            return f"{seconds}秒"
-        
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-        
-        parts = []
-        if hours > 0:
-            parts.append(f"{hours}小时")
-        if minutes > 0:
-            parts.append(f"{minutes}分钟")
-        # 只有在没有小时和分钟时才显示秒
-        if not parts and secs > 0:
-            parts.append(f"{secs}秒")
-        
-        return "".join(parts) if parts else "0秒"
+        """格式化时长为用户友好的字符串。"""
+        return format_duration(seconds)
     
     def _get_friendly_error_message(self, error: Optional[str]) -> str:
         """根据错误信息返回友好的错误提示
@@ -1239,26 +1084,5 @@ class BilibiliCommandHandler(BaseCommand):
         return error
     
     def _simplify_bilibili_links(self, text: str, video_id: str) -> str:
-        """简化消息中的B站链接，减少消息长度
-        
-        将长链接替换为简化的视频ID，避免消息过长被截断
-        
-        Args:
-            text: 原始消息文本
-            video_id: 已解析的视频ID（BV号或AV号）
-            
-        Returns:
-            简化后的消息文本
-        """
-        # 替换完整B站链接（包含各种参数）为视频ID
-        # 匹配: https://www.bilibili.com/video/BVxxx?各种参数
-        # 匹配: https://m.bilibili.com/video/BVxxx?各种参数
-        bilibili_url_pattern = r'https?://(?:www\.|m\.)?bilibili\.com/video/(?:BV[a-zA-Z0-9]{10}|av\d+)[^\s]*'
-        text = re.sub(bilibili_url_pattern, video_id, text)
-        
-        # 替换b23.tv短链接（包含各种参数）为简化形式
-        # 匹配: https://b23.tv/xxx?各种参数
-        short_url_pattern = r'https?://b23\.tv/([a-zA-Z0-9]+)[^\s]*'
-        text = re.sub(short_url_pattern, rf'b23.tv/\1', text)
-        
-        return text
+        """简化消息中的B站链接并清理图片标记，减少消息长度。"""
+        return simplify_bilibili_links(text, video_id)

@@ -50,9 +50,12 @@ Author: 约瑟夫.k && 白泽
 """
 import os
 import re
+import time
+import random
+import hashlib
 import asyncio
 import uuid
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from typing import Optional, Dict, Any, Tuple, Callable
 import aiohttp
 from src.plugin_system import get_logger
@@ -72,12 +75,197 @@ logger = get_logger("bilibili_api")
 class BilibiliAPI:
     """B站API封装类"""
     
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    # 统一请求头（避免各接口头不一致）
+    COMMON_HEADERS = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://www.bilibili.com/",
+        "Origin": "https://www.bilibili.com",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+
     # 默认重试配置
     DEFAULT_MAX_ATTEMPTS = 3
     DEFAULT_RETRY_INTERVAL = 2.0
+
+    # WBI key 缓存（类级）
+    _wbi_keys_cache: Optional[Tuple[str, str]] = None
+    _wbi_keys_expire_at: float = 0.0
+    _wbi_keys_lock: Optional[asyncio.Lock] = None
+    _WBI_CACHE_TTL_SEC = 60 * 30  # 30分钟
+
+    # WBI 混淆映射表
+    _WBI_MIXIN_KEY_ENC_TAB = [
+        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+        27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+        37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+        22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+    ]
     
+    @staticmethod
+    def _build_headers(sessdata: str = "", include_cookie: bool = True) -> Dict[str, str]:
+        headers = dict(BilibiliAPI.COMMON_HEADERS)
+        if include_cookie and sessdata:
+            headers['Cookie'] = f'SESSDATA={sessdata}'
+        return headers
+
+    @staticmethod
+    def _ensure_wbi_lock() -> asyncio.Lock:
+        if BilibiliAPI._wbi_keys_lock is None:
+            BilibiliAPI._wbi_keys_lock = asyncio.Lock()
+        return BilibiliAPI._wbi_keys_lock
+
+    @staticmethod
+    def _invalidate_wbi_cache() -> None:
+        BilibiliAPI._wbi_keys_cache = None
+        BilibiliAPI._wbi_keys_expire_at = 0.0
+
+    @staticmethod
+    def _get_mixin_key(orig: str) -> str:
+        return ''.join(orig[i] for i in BilibiliAPI._WBI_MIXIN_KEY_ENC_TAB)[:32]
+
+    @staticmethod
+    def _sign_wbi_params(params: Dict[str, Any], img_key: str, sub_key: str) -> Dict[str, Any]:
+        mixin_key = BilibiliAPI._get_mixin_key(img_key + sub_key)
+        signed = dict(params)
+        signed['wts'] = round(time.time())
+        signed = dict(sorted(signed.items()))
+
+        filtered = {}
+        for k, v in signed.items():
+            value = ''.join(ch for ch in str(v) if ch not in "!'()*")
+            filtered[k] = value
+
+        query = urlencode(filtered)
+        filtered['w_rid'] = hashlib.md5((query + mixin_key).encode('utf-8')).hexdigest()
+        return filtered
+
+    @staticmethod
+    async def _fetch_wbi_keys(force_refresh: bool = False) -> Tuple[str, str]:
+        now = time.time()
+        if (
+            not force_refresh
+            and BilibiliAPI._wbi_keys_cache
+            and now < BilibiliAPI._wbi_keys_expire_at
+        ):
+            return BilibiliAPI._wbi_keys_cache
+
+        lock = BilibiliAPI._ensure_wbi_lock()
+        async with lock:
+            now = time.time()
+            if (
+                not force_refresh
+                and BilibiliAPI._wbi_keys_cache
+                and now < BilibiliAPI._wbi_keys_expire_at
+            ):
+                return BilibiliAPI._wbi_keys_cache
+
+            nav_url = "https://api.bilibili.com/x/web-interface/nav"
+            headers = BilibiliAPI._build_headers(include_cookie=False)
+            timeout = aiohttp.ClientTimeout(total=15)
+
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(nav_url, headers=headers) as response:
+                    if response.status != 200:
+                        raise RetryableError(
+                            f"获取WBI key失败: status={response.status}",
+                            ErrorType.NETWORK_ERROR,
+                        )
+                    data = await response.json()
+
+            wbi_img = data.get('data', {}).get('wbi_img', {})
+            img_url = wbi_img.get('img_url', '')
+            sub_url = wbi_img.get('sub_url', '')
+            if not img_url or not sub_url:
+                raise RetryableError("WBI key数据缺失", ErrorType.NETWORK_ERROR)
+
+            img_key = img_url.rsplit('/', 1)[-1].split('.', 1)[0]
+            sub_key = sub_url.rsplit('/', 1)[-1].split('.', 1)[0]
+            if not img_key or not sub_key:
+                raise RetryableError("WBI key解析失败", ErrorType.NETWORK_ERROR)
+
+            BilibiliAPI._wbi_keys_cache = (img_key, sub_key)
+            BilibiliAPI._wbi_keys_expire_at = time.time() + BilibiliAPI._WBI_CACHE_TTL_SEC
+            return img_key, sub_key
+
+    @staticmethod
+    async def _call_playurl(
+        aid: int,
+        cid: int,
+        *,
+        use_wbi: bool,
+        sessdata: str = "",
+        force_refresh_wbi: bool = False,
+    ) -> Dict[str, Any]:
+        base_params = {
+            'avid': aid,
+            'cid': cid,
+            'qn': 64,
+            'fnval': 0,
+            'fourk': 1,
+        }
+
+        if use_wbi:
+            img_key, sub_key = await BilibiliAPI._fetch_wbi_keys(force_refresh=force_refresh_wbi)
+            signed = BilibiliAPI._sign_wbi_params(base_params, img_key, sub_key)
+            query = urlencode(signed)
+            url = f"https://api.bilibili.com/x/player/wbi/playurl?{query}"
+        else:
+            query = urlencode(base_params)
+            url = f"https://api.bilibili.com/x/player/playurl?{query}"
+
+        headers = BilibiliAPI._build_headers(sessdata, include_cookie=False)
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                status = response.status
+                try:
+                    data = await response.json(content_type=None)
+                except Exception as e:
+                    raise RetryableError(f"playurl响应解析失败: {e}", ErrorType.NETWORK_ERROR)
+                return {
+                    'status': status,
+                    'data': data,
+                    'url': url,
+                    'use_wbi': use_wbi,
+                }
+
+    @staticmethod
+    def _extract_download_url_from_playurl(data: Dict[str, Any]) -> Optional[str]:
+        payload = data.get('data', {}) if isinstance(data, dict) else {}
+
+        durl = payload.get('durl') or []
+        if durl and isinstance(durl, list):
+            first = durl[0] if durl else {}
+            if isinstance(first, dict):
+                url = first.get('url')
+                if url:
+                    return url
+                backup = first.get('backup_url') or []
+                if backup and isinstance(backup, list):
+                    return backup[0]
+
+        dash = payload.get('dash') or {}
+        if isinstance(dash, dict):
+            video_list = dash.get('video') or []
+            if video_list and isinstance(video_list, list):
+                first_video = video_list[0] if video_list else {}
+                if isinstance(first_video, dict):
+                    url = first_video.get('baseUrl') or first_video.get('base_url')
+                    if url:
+                        return url
+                    backup = first_video.get('backupUrl') or first_video.get('backup_url') or []
+                    if backup and isinstance(backup, list):
+                        return backup[0]
+
+        return None
+
     @staticmethod
     def extract_page_from_url(url: str) -> int:
         """从URL中提取分P号
@@ -158,35 +346,50 @@ class BilibiliAPI:
             视频ID为BV号或AV号，分P号从1开始
         """
         short_url = f"https://b23.tv/{short_code}"
-        headers = {
-            'User-Agent': BilibiliAPI.USER_AGENT,
-        }
-        
+        headers = BilibiliAPI._build_headers(include_cookie=False)
+        timeout = aiohttp.ClientTimeout(total=10)
+
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 # 不自动跟随重定向，手动获取Location
-                async with session.get(short_url, headers=headers, allow_redirects=False) as response:
+                async with session.get(
+                    short_url,
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=timeout,
+                ) as response:
                     if response.status in (301, 302, 303, 307, 308):
                         location = response.headers.get('Location', '')
-                        
+                        if not location:
+                            logger.warning(f"[BilibiliAPI] 短链接重定向缺少Location: code={short_code}")
+                            return None
+
                         # 从重定向URL中提取分P号
                         page = BilibiliAPI.extract_page_from_url(location)
-                        
+
                         # 从重定向URL中提取视频ID
                         bv_match = re.search(r'BV[a-zA-Z0-9]{10}', location, re.IGNORECASE)
                         if bv_match:
                             video_id = bv_match.group(0)
+                            logger.debug(f"[BilibiliAPI] 短链接解析成功: {short_code} -> {video_id}, p={page}")
                             return (video_id, page)
-                        
+
                         av_match = re.search(r'av(\d+)', location, re.IGNORECASE)
                         if av_match:
                             video_id = f"av{av_match.group(1)}"
+                            logger.debug(f"[BilibiliAPI] 短链接解析成功: {short_code} -> {video_id}, p={page}")
                             return (video_id, page)
-                        
+
                         logger.warning(f"[BilibiliAPI] 短链接重定向URL中未找到视频ID: {location}")
                     else:
-                        logger.warning(f"[BilibiliAPI] 短链接请求未重定向: status={response.status}")
-            
+                        logger.warning(f"[BilibiliAPI] 短链接请求未重定向: status={response.status}, code={short_code}")
+
+            return None
+        except asyncio.TimeoutError:
+            logger.warning(f"[BilibiliAPI] 解析短链接超时: code={short_code}")
+            return None
+        except aiohttp.ClientError as e:
+            logger.warning(f"[BilibiliAPI] 解析短链接网络异常: code={short_code}, error={e}")
             return None
         except Exception as e:
             logger.error(f"[BilibiliAPI] 解析短链接失败: {e}")
@@ -225,10 +428,7 @@ class BilibiliAPI:
         else:
             url = f"https://api.bilibili.com/x/web-interface/view?bvid={video_id}"
         
-        headers = {
-            'User-Agent': BilibiliAPI.USER_AGENT,
-            'Referer': 'https://www.bilibili.com/'
-        }
+        headers = BilibiliAPI._build_headers(include_cookie=False)
         
         if sessdata:
             headers['Cookie'] = f'SESSDATA={sessdata}'
@@ -339,13 +539,7 @@ class BilibiliAPI:
         retry_interval = retry_interval or BilibiliAPI.DEFAULT_RETRY_INTERVAL
         
         url = f"https://api.bilibili.com/x/player/wbi/v2?aid={aid}&cid={cid}"
-        headers = {
-            'User-Agent': BilibiliAPI.USER_AGENT,
-            'Referer': 'https://www.bilibili.com/'
-        }
-        
-        if sessdata:
-            headers['Cookie'] = f'SESSDATA={sessdata}'
+        headers = BilibiliAPI._build_headers(sessdata)
         
         logger.debug(f"[BilibiliAPI] 获取字幕: aid={aid}, cid={cid}")
         
@@ -435,10 +629,7 @@ class BilibiliAPI:
         Returns:
             字幕文本
         """
-        headers = {
-            'User-Agent': BilibiliAPI.USER_AGENT,
-            'Referer': 'https://www.bilibili.com/'
-        }
+        headers = BilibiliAPI._build_headers(include_cookie=False)
         
         try:
             async with aiohttp.ClientSession() as session:
@@ -482,104 +673,189 @@ class BilibiliAPI:
         retry_interval: float = None,
     ) -> Optional[Dict[str, Any]]:
         """获取视频下载链接（带重试机制）
-        
+
+        下载链路优先使用 WBI 签名接口以降低 412，失败后回退旧接口。
+
         Args:
             video_id: 视频ID (BV号或AV号)
-            sessdata: B站SESSDATA Cookie
+            sessdata: B站SESSDATA Cookie（仅保留参数兼容，下载链路默认不依赖）
             page: 分P号（从1开始），默认为1
             max_attempts: 最大重试次数
             retry_interval: 重试间隔（秒）
-            
+
         Returns:
             包含下载链接和视频信息的字典
-            
+
         Raises:
             NonRetryableError: 不可重试的错误
         """
         max_attempts = max_attempts or BilibiliAPI.DEFAULT_MAX_ATTEMPTS
         retry_interval = retry_interval or BilibiliAPI.DEFAULT_RETRY_INTERVAL
-        
-        # 先获取视频基本信息（已有重试机制）
-        video_info = await BilibiliAPI.get_video_info(video_id, sessdata, page, max_attempts, retry_interval)
+
+        # 先获取视频基本信息（下载链路不依赖SESSDATA）
+        video_info = await BilibiliAPI.get_video_info(video_id, "", page, max_attempts, retry_interval)
         if not video_info:
             return None
-        
+
         aid = video_info.get('aid')
         cid = video_info.get('cid')
-        
         if not aid or not cid:
             logger.error("[BilibiliAPI] 无法获取视频aid或cid")
             return None
-        
-        # 获取视频流地址
-        url = f"https://api.bilibili.com/x/player/playurl?avid={aid}&cid={cid}&qn=64&fnval=0&fourk=1"
-        headers = {
-            'User-Agent': BilibiliAPI.USER_AGENT,
-            'Referer': 'https://www.bilibili.com/'
-        }
-        
-        if sessdata:
-            headers['Cookie'] = f'SESSDATA={sessdata}'
-        
+
         logger.debug(f"[BilibiliAPI] 获取下载地址: aid={aid}, cid={cid}")
-        
-        async def _fetch():
+
+        last_non_retryable: Optional[NonRetryableError] = None
+
+        for attempt in range(1, max_attempts + 1):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            code = data.get('code', 0)
-                            
-                            if code == 0:
-                                durl = data.get('data', {}).get('durl', [])
-                                if durl:
-                                    download_url = durl[0].get('url')
-                                    if download_url:
-                                            return {
-                                            'url': download_url,
-                                            'title': video_info.get('title'),
-                                            'duration': video_info.get('duration'),
-                                            'aid': aid,
-                                            'cid': cid
-                                        }
-                            else:
-                                message = data.get('message', '未知错误')
-                                error_type, retryable = classify_bilibili_error(code, message)
-                                
-                                if retryable:
-                                    raise RetryableError(f"B站API错误: code={code}, message={message}", error_type)
-                                else:
-                                    raise NonRetryableError(f"B站API错误: code={code}, message={message}", error_type)
-                        else:
-                            error_type, retryable = classify_http_error(response.status)
-                            
-                            if retryable:
-                                raise RetryableError(f"HTTP请求失败: status={response.status}", error_type)
-                            else:
-                                raise NonRetryableError(f"HTTP请求失败: status={response.status}", error_type)
-                
-                await asyncio.sleep(0.5)
+                # 1) 优先 WBI
+                try:
+                    resp = await BilibiliAPI._call_playurl(
+                        aid,
+                        cid,
+                        use_wbi=True,
+                        sessdata="",
+                        force_refresh_wbi=(attempt > 1),
+                    )
+                except RetryableError as e:
+                    logger.warning(f"[BilibiliAPI] WBI请求失败，回退旧接口: {e}")
+                    resp = await BilibiliAPI._call_playurl(
+                        aid,
+                        cid,
+                        use_wbi=False,
+                        sessdata="",
+                    )
+
+                status = resp.get('status', 0)
+                data = resp.get('data', {}) if isinstance(resp, dict) else {}
+                use_wbi = bool(resp.get('use_wbi'))
+
+                # 2) HTTP状态码处理（412定向恢复）
+                if status != 200:
+                    if status == 412:
+                        BilibiliAPI._invalidate_wbi_cache()
+                        wait_time = retry_interval * (2 ** (attempt - 1)) + random.uniform(0, 0.6)
+                        if attempt < max_attempts:
+                            logger.warning(
+                                "[BilibiliAPI] 下载地址触发412（%s），第%d/%d次，%.2fs后重试",
+                                "WBI" if use_wbi else "Legacy",
+                                attempt,
+                                max_attempts,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        raise NonRetryableError(
+                            "HTTP请求失败: status=412（可能触发B站风控）",
+                            ErrorType.PERMISSION_DENIED,
+                        )
+
+                    error_type, retryable = classify_http_error(status)
+                    if retryable:
+                        raise RetryableError(f"HTTP请求失败: status={status}", error_type)
+                    raise NonRetryableError(f"HTTP请求失败: status={status}", error_type)
+
+                # 3) B站业务码处理
+                code = data.get('code', 0)
+                if code != 0:
+                    message = data.get('message', '未知错误')
+                    error_type, retryable = classify_bilibili_error(code, message)
+
+                    # 部分场景风控会返回业务码+412提示
+                    if ('412' in str(message)) and attempt < max_attempts:
+                        BilibiliAPI._invalidate_wbi_cache()
+                        wait_time = retry_interval * (2 ** (attempt - 1)) + random.uniform(0, 0.6)
+                        logger.warning(
+                            "[BilibiliAPI] 下载地址业务风控（code=%s, message=%s），第%d/%d次，%.2fs后重试",
+                            code,
+                            message,
+                            attempt,
+                            max_attempts,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    if retryable:
+                        raise RetryableError(
+                            f"B站API错误: code={code}, message={message}",
+                            error_type,
+                        )
+                    raise NonRetryableError(
+                        f"B站API错误: code={code}, message={message}",
+                        error_type,
+                    )
+
+                # 4) 解析下载地址（兼容 durl/dash）
+                download_url = BilibiliAPI._extract_download_url_from_playurl(data)
+                if download_url:
+                    return {
+                        'url': download_url,
+                        'title': video_info.get('title'),
+                        'duration': video_info.get('duration'),
+                        'aid': aid,
+                        'cid': cid,
+                    }
+
+                # 5) WBI 成功但无链接，则回退旧接口再试一次
+                if use_wbi:
+                    fallback = await BilibiliAPI._call_playurl(
+                        aid,
+                        cid,
+                        use_wbi=False,
+                        sessdata="",
+                    )
+                    fallback_status = fallback.get('status', 0)
+                    fallback_data = fallback.get('data', {}) if isinstance(fallback, dict) else {}
+
+                    if fallback_status == 200 and fallback_data.get('code', 0) == 0:
+                        download_url = BilibiliAPI._extract_download_url_from_playurl(fallback_data)
+                        if download_url:
+                            return {
+                                'url': download_url,
+                                'title': video_info.get('title'),
+                                'duration': video_info.get('duration'),
+                                'aid': aid,
+                                'cid': cid,
+                            }
+
+                raise NonRetryableError("未找到可用的视频下载链接", ErrorType.NO_CONTENT)
+
+            except NonRetryableError as e:
+                last_non_retryable = e
+                if '412' in str(e) and attempt < max_attempts:
+                    wait_time = retry_interval * (2 ** (attempt - 1)) + random.uniform(0, 0.6)
+                    logger.warning(
+                        "[BilibiliAPI] 下载地址遇到412，第%d/%d次，%.2fs后重试",
+                        attempt,
+                        max_attempts,
+                        wait_time,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                break
+            except (RetryableError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < max_attempts:
+                    wait_time = retry_interval * (2 ** (attempt - 1)) + random.uniform(0, 0.6)
+                    logger.warning(
+                        "[BilibiliAPI] 下载地址网络异常: %s，第%d/%d次，%.2fs后重试",
+                        str(e),
+                        attempt,
+                        max_attempts,
+                        wait_time,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                logger.error(f"[BilibiliAPI] 获取下载地址失败（重试{max_attempts}次后）: {e}")
                 return None
-                
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                raise RetryableError(f"网络错误: {e}", ErrorType.NETWORK_ERROR)
-        
-        try:
-            return await retry_async(
-                _fetch,
-                max_attempts=max_attempts,
-                interval_sec=retry_interval,
-                retryable_exceptions=(RetryableError,),
-            )
-        except NonRetryableError:
-            raise
-        except RetryableError as e:
-            logger.error(f"[BilibiliAPI] 获取下载地址失败（重试{max_attempts}次后）: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"[BilibiliAPI] 获取下载地址失败: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"[BilibiliAPI] 获取下载地址失败: {e}")
+                return None
+
+        if last_non_retryable:
+            raise last_non_retryable
+        return None
     
     @staticmethod
     async def download_video(
@@ -614,10 +890,7 @@ class BilibiliAPI:
         
         max_bytes = max_size_mb * 1024 * 1024
         
-        headers = {
-            'User-Agent': BilibiliAPI.USER_AGENT,
-            'Referer': 'https://www.bilibili.com/'
-        }
+        headers = BilibiliAPI._build_headers(include_cookie=False)
         
         logger.debug(f"[BilibiliAPI] 开始下载视频到: {tmp_path}")
         

@@ -49,5 +49,17 @@ Author: 约瑟夫.k && 白泽
 """
 from .video_service import VideoService, VideoProcessResult
 from .summary_service import SummaryService
+from .text_format_service import (
+    format_duration,
+    build_basic_info_text,
+    simplify_bilibili_links,
+)
 
-__all__ = ['VideoService', 'VideoProcessResult', 'SummaryService']
+__all__ = [
+    'VideoService',
+    'VideoProcessResult',
+    'SummaryService',
+    'format_duration',
+    'build_basic_info_text',
+    'simplify_bilibili_links',
+]

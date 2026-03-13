@@ -78,7 +78,7 @@ Author: 约瑟夫.k && 白泽
 import os
 import math
 import uuid
-import subprocess
+import asyncio
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Callable
 from src.plugin_system import llm_api, get_logger
@@ -308,25 +308,26 @@ class VideoService:
             
             # 视觉分析方式
             visual_method = self.get_config("analysis.visual_method", "default")
-            
-            # 硬编码最大抽帧数和最大分析帧数
-            MAX_EXTRACT_FRAMES = 10  # 最大抽帧数
-            MAX_ANALYZE_FRAMES = 5   # 最大VLM分析帧数（在handlers.py中使用）
+            LOCKED_MAX_FRAMES = 5  # 锁定模式下的最大抽帧数
             
             # 根据 visual_method 获取对应模式的配置
             if visual_method == "default":
                 visual_max_duration_min = self.get_config("analysis.default.visual_max_duration_min", 10.0)
+                lock_max_frames_5 = self.get_config("analysis.default.lock_max_frames_5", True)
                 frame_interval = self.get_config("analysis.default.frame_interval_sec", 6)
             elif visual_method == "builtin":
                 visual_max_duration_min = self.get_config("analysis.builtin.visual_max_duration_min", 10.0)
+                lock_max_frames_5 = self.get_config("analysis.builtin.lock_max_frames_5", True)
                 frame_interval = self.get_config("analysis.builtin.frame_interval_sec", 6)
             elif visual_method == "doubao":
                 visual_max_duration_min = self.get_config("analysis.doubao.visual_max_duration_min", 10.0)
                 frame_interval = 6  # 豆包模式不使用抽帧
+                lock_max_frames_5 = True
             else:
                 # none 模式或其他：不进行视觉分析
                 visual_max_duration_min = 0
                 frame_interval = 6
+                lock_max_frames_5 = True
             
             # 同样使用向下取整：10分钟限制 -> 10分59秒的视频仍然进行视觉分析
             visual_max_duration_sec = int((visual_max_duration_min + 1) * 60) - 1
@@ -412,8 +413,9 @@ class VideoService:
                 download_timeout_sec = self.get_config("video.download_timeout_sec", 300)
                 
                 try:
+                    # 下载链路默认不依赖SESSDATA（SESSDATA仅用于字幕）
                     download_info = await bilibili_api.get_video_download_url(
-                        video_id, sessdata, page,
+                        video_id, "", page,
                         max_attempts=retry_max_attempts,
                         retry_interval=retry_interval_sec
                     )
@@ -466,17 +468,34 @@ class VideoService:
                 # default/builtin 都使用VLM抽帧分析
                 if visual_method in ("default", "builtin") or (visual_method == "doubao" and not result.visual_analysis):
                     # 使用VLM抽帧分析
-                    # 根据视频时长和抽帧间隔自动计算抽帧数量，最多 MAX_EXTRACT_FRAMES 帧
-                    if result.duration:
-                        n_frames = max(1, int(math.ceil(float(result.duration) / max(1, frame_interval))))
-                        n_frames = min(n_frames, MAX_EXTRACT_FRAMES)
-                        result.frame_paths = await self.video_parser.extract_frames_equidistant(
-                            result.video_path, result.duration, n_frames
-                        )
+                    # 规则：
+                    # - lock_max_frames_5=True: 固定等距抽5帧（最多5帧）
+                    # - lock_max_frames_5=False: 使用 frame_interval_sec 动态计算后等距抽帧
+                    # - lock_max_frames_5=False 且时长未知: 降级到固定5帧逻辑
+                    resolved_duration = result.duration
+                    if not resolved_duration:
+                        resolved_duration = self.video_parser.get_video_duration(result.video_path)
+
+                    if lock_max_frames_5:
+                        if resolved_duration:
+                            result.frame_paths = await self.video_parser.extract_frames_equidistant(
+                                result.video_path, float(resolved_duration), LOCKED_MAX_FRAMES
+                            )
+                        else:
+                            result.frame_paths = await self.video_parser.extract_frames(
+                                result.video_path, max(1, frame_interval), LOCKED_MAX_FRAMES
+                            )
                     else:
-                        result.frame_paths = await self.video_parser.extract_frames(
-                            result.video_path, frame_interval, MAX_EXTRACT_FRAMES
-                        )
+                        if resolved_duration:
+                            n_frames = max(1, int(math.ceil(float(resolved_duration) / max(1, frame_interval))))
+                            result.frame_paths = await self.video_parser.extract_frames_equidistant(
+                                result.video_path, float(resolved_duration), n_frames
+                            )
+                        else:
+                            # 时长未知时降级到 true 逻辑：固定5帧
+                            result.frame_paths = await self.video_parser.extract_frames(
+                                result.video_path, max(1, frame_interval), LOCKED_MAX_FRAMES
+                            )
                     
                     if result.frame_paths:
                         result.frames_dir = os.path.dirname(result.frame_paths[0])
@@ -595,7 +614,7 @@ class VideoService:
             audio_filename = f"bili_audio_{uuid.uuid4().hex[:8]}.wav"
             audio_path = os.path.join(audio_temp_dir, audio_filename)
             
-            # 使用ffmpeg提取音频
+            # 使用ffmpeg提取音频（异步子进程，避免阻塞事件循环）
             cmd = [
                 self.video_parser.ffmpeg_path,
                 "-y",
@@ -606,19 +625,27 @@ class VideoService:
                 "-ac", "1",  # 单声道
                 audio_path
             ]
-            
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=120
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            
-            if result.returncode == 0 and os.path.exists(audio_path):
-                return audio_path
-            else:
-                logger.warning(f"[VideoService] 音频提取失败: {result.stderr.decode()[:200]}")
+
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                logger.warning("[VideoService] 音频提取超时（120秒）")
                 return None
+
+            if process.returncode == 0 and os.path.exists(audio_path):
+                return audio_path
+
+            err = (stderr or b"").decode(errors="ignore")
+            logger.warning(f"[VideoService] 音频提取失败: {err[:200]}")
+            return None
                 
         except Exception as e:
             logger.error(f"[VideoService] 提取音频异常: {e}")

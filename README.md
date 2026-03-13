@@ -37,9 +37,19 @@
 
 ### 安装 ffmpeg
 
-- 本插件需要系统安装 **ffmpeg** 工具。插件会自动检测系统 PATH 中的 ffmpeg。
+本插件依赖 `ffmpeg` / `ffprobe`。默认从系统 `PATH` 检测，也支持在插件配置中指定路径。
 
-
+- **Windows**
+  - 推荐方式A：把 ffmpeg 的 `bin` 目录加入系统 `PATH`
+  - 推荐方式B：在插件配置 `[video].ffmpeg_path` 中填写：
+    - `bin` 目录路径（示例：`C:\\tools\\ffmpeg\\bin`）
+    - 或 `ffmpeg.exe` 完整路径（示例：`C:\\tools\\ffmpeg\\bin\\ffmpeg.exe`）
+- **Linux**
+  - 通过包管理器安装，通常无需单独配置路径：
+    - Debian/Ubuntu：`sudo apt update && sudo apt install -y ffmpeg`
+    - CentOS/RHEL/Fedora：`sudo yum install -y ffmpeg` 或 `sudo dnf install -y ffmpeg`
+- **容器环境（Docker）**
+  - 与 Linux 一致：进入容器内部通过命令手动安装 ffmpeg
 
 ---
 
@@ -73,7 +83,7 @@
 
 ## 使用方法
 
-> ⚠️ **注意**：目前仅支持 B站视频链接，**不支持** QQ 中分享的 B站小程序卡片。如需解析视频，请复制视频链接发送。
+> ✅ 支持 B站视频链接、BV/AV 号，以及 QQ 中分享的 B站小程序卡片（需适配器为最新版本）。
 
 ### 自动检测模式
 
@@ -106,7 +116,7 @@ BV1xx411c7XZ
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `config_version` | string | `"3.1.0"` | 配置文件版本号，请勿手动修改 |
+| `config_version` | string | `"3.2.0"` | 配置文件版本号，请勿手动修改 |
 | `enabled` | bool | `true` | 是否启用插件 |
 
 ### [trigger] 触发方式配置
@@ -141,6 +151,7 @@ BV1xx411c7XZ
 | `max_duration_min` | float | `60.0` | 视频最大时长（分钟）。超过此时长的视频将被跳过不处理 |
 | `max_size_mb` | int | `300` | 视频最大文件大小（MB）。超过此大小的视频将被跳过 |
 | `sessdata` | string | `""` | B站SESSDATA Cookie。用于获取视频字幕，不填写时将跳过字幕获取。<br />**使用此功能可能会导致账号被b站风控，请使用小号。** |
+| `ffmpeg_path` | string | `""` | ffmpeg路径（可选）。Windows可填写 ffmpeg 的 `bin` 目录或 `ffmpeg(.exe)` 完整路径；Linux/容器通常留空并使用系统 PATH |
 | `enable_asr` | bool | `false` | 是否启用ASR语音识别。开启后会从视频音轨中提取语音进行识别，作为字幕的补充 |
 | `cache_enabled` | bool | `true` | 是否启用视频解析结果缓存。开启后，相同视频不会重复解析 |
 | `temp_file_max_age_min` | int | `60` | 临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除 |
@@ -164,6 +175,19 @@ BV1xx411c7XZ
 5. 找到名为 `SESSDATA` 的 Cookie，复制其值
 ![alt text](image.png)
 
+**Windows 的 `ffmpeg_path` 填写示例：**
+
+```toml
+[video]
+# 方式1：填 bin 目录
+ffmpeg_path = "C:\\tools\\ffmpeg\\bin"
+
+# 方式2：填 ffmpeg.exe 完整路径
+# ffmpeg_path = "C:\\tools\\ffmpeg\\bin\\ffmpeg.exe"
+```
+
+> Linux 与容器环境通常不需要填写 `ffmpeg_path`，保持为空即可。
+
 ### [analysis] 视觉分析配置
 
 | 配置项 | 类型 | 默认值 | 说明 |
@@ -186,7 +210,8 @@ BV1xx411c7XZ
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟）。超过此时长的视频将只使用字幕+ASR，不进行视觉分析（节省API费用） |
-| `frame_interval_sec` | int | `10` | 抽帧间隔（秒）。每隔多少秒抽取一帧，系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧，最多分析5帧） |
+| `lock_max_frames_5` | bool | `true` | 是否锁定为固定等距抽5帧。`true`：固定等距抽5帧（最多5帧）；`false`：按视频时长和 `frame_interval_sec` 动态计算等距抽帧；若时长未知则降级到固定5帧逻辑 |
+| `frame_interval_sec` | int | `10` | 抽帧间隔（秒）。仅在 `lock_max_frames_5=false` 时生效，用于按视频时长动态计算等距抽帧数量 |
 | `frame_prompt` | string | `""` | 自定义帧分析提示词，留空使用默认提示词 |
 
 > ⚠️ **关于 frame_prompt 的说明**：
@@ -205,7 +230,8 @@ BV1xx411c7XZ
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟） |
-| `frame_interval_sec` | int | `10` | 抽帧间隔（秒），系统会根据视频时长和此间隔自动计算抽帧数量（最多10帧，最多分析5帧） |
+| `lock_max_frames_5` | bool | `true` | 是否锁定为固定等距抽5帧。`true`：固定等距抽5帧（最多5帧）；`false`：按视频时长和 `frame_interval_sec` 动态计算等距抽帧；若时长未知则降级到固定5帧逻辑 |
+| `frame_interval_sec` | int | `10` | 抽帧间隔（秒）。仅在 `lock_max_frames_5=false` 时生效，用于按视频时长动态计算等距抽帧数量 |
 | `client_type` | string | `"openai"` | API服务类型：`openai`（兼容OpenAI格式的API）或 `gemini`（Google Gemini格式） |
 | `base_url` | string | `"https://api.siliconflow.cn/v1"` | API基础URL |
 | `api_key` | string | `""` | API密钥 |
@@ -324,17 +350,28 @@ model_id = "doubao-seed-1-6-flash-250828"
 **症状**：插件加载时提示 "ffmpeg不可用，视频解析功能将受限"
 
 **解决方法**：
-1. 在终端运行 `ffmpeg -version` 确认安装成功
-2. 如果命令不存在，请按照上述安装方法安装 ffmpeg
-3. Windows 用户安装后需要重启终端或电脑
-4. 手动安装的用户请确认 bin 目录已添加到 PATH
+1. 在终端运行 `ffmpeg -version` 与 `ffprobe -version` 确认安装成功
+2. 如果命令不存在，请先安装 ffmpeg：
+   - Linux：`apt/yum/dnf` 安装
+   - 容器：在镜像内安装并确保 `PATH` 可见
+3. Windows 用户可二选一：
+   - 将 ffmpeg 的 `bin` 目录加入 `PATH`
+   - 在插件配置 `[video].ffmpeg_path` 中填写 `bin` 目录或 `ffmpeg.exe` 完整路径
+4. 修改配置后重启 MaiBot 使配置生效
 
 ### 视频下载失败
 
 **可能原因**：
-- 视频需要B站登录才能观看（配置 SESSDATA 可解决部分情况）
-- 视频有地区限制
+- 触发 B站风控（常见状态码：`412`）
+- 视频有地区限制或版权限制
 - 网络连接问题
+
+**插件内置恢复策略（已自动执行）**：
+- 下载地址优先走 WBI 签名接口，失败自动回退旧接口
+- 对 `412` 执行定向恢复（刷新签名 key + 指数退避重试）
+- 重试后仍失败时自动降级到字幕模式或基础信息模式
+
+> 说明：`SESSDATA` 在本插件中主要用于字幕获取，不作为视频下载成功的前置条件。
 
 ### 字幕获取失败
 

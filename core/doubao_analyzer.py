@@ -204,14 +204,15 @@ class DoubaoAnalyzer:
                 logger.debug(f"[DoubaoAnalyzer] 开始上传视频文件 (尝试 {attempt + 1}/{max_retries + 1})")
                 
                 # 上传视频文件（动态构建预处理配置）
-                upload_kwargs = {
-                    "file": open(video_path, "rb"),
-                    "purpose": "user_data",
-                }
-                if video_preprocess_config:
-                    upload_kwargs["preprocess_configs"] = {"video": video_preprocess_config}
-                
-                file = await self._client.files.create(**upload_kwargs)
+                with open(video_path, "rb") as video_file:
+                    upload_kwargs = {
+                        "file": video_file,
+                        "purpose": "user_data",
+                    }
+                    if video_preprocess_config:
+                        upload_kwargs["preprocess_configs"] = {"video": video_preprocess_config}
+
+                    file = await self._client.files.create(**upload_kwargs)
                 
                 logger.debug(f"[DoubaoAnalyzer] 视频上传成功: {file.id}，等待处理...")
                 

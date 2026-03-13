@@ -66,6 +66,7 @@ Author: 约瑟夫.k && 白泽
 import os
 import shutil
 import subprocess
+import asyncio
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 from src.plugin_system import get_logger
@@ -93,45 +94,111 @@ class VideoParser:
             **kwargs: 其他参数（保留兼容性）
         """
         self.ffmpeg_path = self._detect_ffmpeg(ffmpeg_path)
-        self.ffprobe_path = self._detect_ffprobe()
+        self.ffprobe_path = self._detect_ffprobe(ffmpeg_path)
+
+    def _resolve_binary_path(self, base_path: str, binary_name: str) -> Optional[str]:
+        """将目录或文件路径解析为具体可执行文件路径。"""
+        if not base_path:
+            return None
+
+        normalized = os.path.normpath(base_path.strip().strip('"'))
+        if not normalized:
+            return None
+
+        # 目录场景：兼容直接传 bin 目录
+        if os.path.isdir(normalized):
+            candidates = [
+                os.path.join(normalized, f"{binary_name}.exe"),
+                os.path.join(normalized, binary_name),
+            ]
+            for candidate in candidates:
+                if os.path.isfile(candidate):
+                    return candidate
+            return None
+
+        target_names = {binary_name.lower(), f"{binary_name.lower()}.exe"}
+
+        # 文件场景：
+        # - ffmpeg_path 可传 ffmpeg(.exe)
+        # - 若传入的是另一个可执行文件（如 ffmpeg 用于查 ffprobe），
+        #   则尝试同目录定位目标可执行文件
+        if os.path.isfile(normalized):
+            file_name = os.path.basename(normalized).lower()
+            if file_name in target_names:
+                return normalized
+
+            parent_dir = os.path.dirname(normalized)
+            for name in (f"{binary_name}.exe", binary_name):
+                candidate = os.path.join(parent_dir, name)
+                if os.path.isfile(candidate):
+                    return candidate
+            return None
+
+        # 兼容未写扩展名的输入，如 C:\ffmpeg\bin\ffmpeg
+        suffix_candidates = [f"{normalized}.exe", normalized]
+        for candidate in suffix_candidates:
+            if os.path.isfile(candidate):
+                file_name = os.path.basename(candidate).lower()
+                if file_name in target_names:
+                    return candidate
+
+        return None
 
     def _detect_ffmpeg(self, custom_path: Optional[str] = None) -> Optional[str]:
-        """自动检测ffmpeg路径
-        
-        Args:
-            custom_path: 用户指定的路径
-            
-        Returns:
-            ffmpeg可执行文件路径
+        """自动检测ffmpeg路径。
+
+        优先级：
+        1. 用户配置路径（支持目录或文件）
+        2. 系统 PATH
         """
-        # 1. 如果用户指定了路径，优先使用
         if custom_path:
-            if shutil.which(custom_path):
-                return shutil.which(custom_path)
+            resolved = self._resolve_binary_path(custom_path, "ffmpeg")
+            if resolved and os.path.isfile(resolved):
+                return resolved
+
+            which_result = shutil.which(custom_path)
+            if which_result:
+                return which_result
+
             logger.warning(f"[VideoParser] 指定的ffmpeg路径无效: {custom_path}")
-        
-        # 2. 尝试从系统PATH查找
+
         system_ffmpeg = shutil.which("ffmpeg")
         if system_ffmpeg:
             return system_ffmpeg
-        
+
         logger.error("[VideoParser] 未找到ffmpeg，请安装后重试")
         return None
 
-    def _detect_ffprobe(self) -> Optional[str]:
-        """自动检测ffprobe路径"""
-        # 1. 尝试从系统PATH查找
+    def _detect_ffprobe(self, custom_ffmpeg_path: Optional[str] = None) -> Optional[str]:
+        """自动检测ffprobe路径。"""
+        # 1. 优先尝试：如果用户配置了 ffmpeg 路径，尝试同目录解析 ffprobe
+        if custom_ffmpeg_path:
+            custom_ffprobe = self._resolve_binary_path(custom_ffmpeg_path, "ffprobe")
+            if custom_ffprobe:
+                return custom_ffprobe
+
+            # 用户传了 ffmpeg 文件路径时，再尝试同目录拼接 ffprobe
+            resolved_ffmpeg = self._resolve_binary_path(custom_ffmpeg_path, "ffmpeg")
+            if resolved_ffmpeg:
+                ffmpeg_dir = os.path.dirname(resolved_ffmpeg)
+                for name in ("ffprobe.exe", "ffprobe"):
+                    candidate = os.path.join(ffmpeg_dir, name)
+                    if os.path.isfile(candidate):
+                        return candidate
+
+        # 2. 尝试从系统PATH查找
         system_ffprobe = shutil.which("ffprobe")
         if system_ffprobe:
             return system_ffprobe
-        
-        # 2. 尝试从ffmpeg同目录查找
+
+        # 3. 尝试从最终ffmpeg路径同目录查找
         if self.ffmpeg_path:
             ffmpeg_dir = os.path.dirname(self.ffmpeg_path)
-            ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe")
-            if os.path.exists(ffprobe_path):
-                return ffprobe_path
-        
+            for name in ("ffprobe.exe", "ffprobe"):
+                ffprobe_path = os.path.join(ffmpeg_dir, name)
+                if os.path.isfile(ffprobe_path):
+                    return ffprobe_path
+
         return None
 
     def check_ffmpeg(self) -> bool:
@@ -197,15 +264,23 @@ class VideoParser:
                 output_pattern
             ]
             
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=300
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            
-            if result.returncode != 0:
-                logger.error(f"[VideoParser] 抽帧失败: {result.stderr.decode()}")
+
+            try:
+                _, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                logger.error("[VideoParser] 抽帧失败: ffmpeg执行超时（300秒）")
+                return []
+
+            if process.returncode != 0:
+                err = (stderr or b"").decode(errors="ignore")
+                logger.error(f"[VideoParser] 抽帧失败: {err}")
                 return []
             
             # 收集生成的帧
@@ -268,14 +343,21 @@ class VideoParser:
                     frame_path
                 ]
                 
-                result = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=30
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                
-                if result.returncode == 0 and os.path.exists(frame_path):
+
+                try:
+                    _, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.communicate()
+                    logger.warning(f"[VideoParser] 在 {t:.3f}s 处抽帧超时")
+                    continue
+
+                if process.returncode == 0 and os.path.exists(frame_path):
                     # 验证并确保是JPEG格式
                     converted_path = self._ensure_jpeg_format(frame_path)
                     if converted_path:
@@ -283,7 +365,8 @@ class VideoParser:
                     else:
                         frames.append(frame_path)
                 else:
-                    logger.warning(f"[VideoParser] 在 {t:.3f}s 处抽帧失败")
+                    err = (stderr or b"").decode(errors="ignore")
+                    logger.warning(f"[VideoParser] 在 {t:.3f}s 处抽帧失败: {err[:120]}")
             
             logger.debug(f"[VideoParser] 等距抽帧完成: 共抽取 {len(frames)} 帧")
             return frames
