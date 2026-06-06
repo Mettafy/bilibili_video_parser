@@ -1,537 +1,845 @@
-# -*- coding: utf-8 -*-
-"""
-B站视频内容解析插件 - 插件主入口模块
+"""Maisaka 版 B 站视频解析插件入口。"""
 
-本模块是B站视频解析插件的主入口，负责：
-1. 插件注册和生命周期管理
-2. 配置Schema定义和管理
-3. 组件（Handler/Command）的注册
-4. 定时清理任务的启动和停止
+from __future__ import annotations
 
-插件功能概述：
-- 自动检测模式：检测消息中的B站链接，自动解析视频内容
-- 命令模式：通过 /bili 命令手动触发视频解析
-- 支持多种视觉分析方式：MaiBot VLM、插件内置VLM、豆包视频模型
-- 支持字幕获取和ASR语音识别
-- 支持多P视频和合集
-
-主要类：
-- BilibiliVideoParserPlugin: 插件主类，继承自BasePlugin
-
-配置节：
-- plugin: 插件基本信息
-- trigger: 触发方式配置
-- video: 全局视频配置
-- analysis: 视觉分析配置
-- analysis.default: Default模式配置（使用MaiBot VLM）
-- analysis.builtin: Builtin模式配置（使用插件内置VLM）
-- analysis.doubao: Doubao模式配置（使用豆包视频模型）
-- cache: 缓存配置
-
-依赖模块：
-- core.handlers: 事件处理器
-- core.cache_manager: 缓存管理
-- core.video_parser: 视频解析（ffmpeg）
-- core.video_analyzer: 视频分析（VLM）
-- core.safe_delete: 安全文件删除
-
-Author: 约瑟夫.k && 白泽
-Version: 1.0.0
-"""
 import asyncio
-from typing import List, Tuple, Type, Optional
+import logging
+
 from pathlib import Path
+from time import monotonic
+from typing import Any
+import hashlib
+import json
 
-from src.plugin_system import (
-    BasePlugin,
-    register_plugin,
-    ComponentInfo,
-    ConfigField,
-    get_logger,
-)
+from maibot_sdk import Command, HookHandler, MaiBotPlugin
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
-from .core.handlers import BilibiliAutoDetectHandler, BilibiliCommandHandler
+from .config import BilibiliVideoParserConfig
+from .core.asr.openai_compatible import OpenAICompatibleAsrProvider
+from .core.asr_service import AsrService
 from .core.cache_manager import CacheManager
-from .core.video_parser import VideoParser
+from .core.metadata_service import MetadataService
+from .core.pipeline import PipelineConfig, PipelineDependencies
+from .core.pipeline import VideoPipeline
+from .core.safe_delete import cleanup_old_temp_files, init_temp_dir
+from .core.subtitle_service import SubtitleService
+from .core.text_render_service import TextRenderService
 from .core.video_analyzer import VideoAnalyzer
-from .core.safe_delete import init_temp_dir, cleanup_old_temp_files
+from .core.video_parser import VideoParser
+from .core.visual_service import VisualService
+from .runtime import AutoDetectResultService, CommandRequestParser, CommandResultService, HookInjector, LLMHostAdapter, MessageContextBuilder, MessageFormatter, NapCatBilibiliResolver
+from .runtime.llm_host_adapter import HostTimeoutPolicy
 
-logger = get_logger("bilibili_video_parser")
+
+HOOK_TIMEOUT_MS = 300_000
 
 
-@register_plugin
-class BilibiliVideoParserPlugin(BasePlugin):
-    """B站视频内容解析插件"""
+class BilibiliVideoParserMaisakaPlugin(MaiBotPlugin):
+    """基于 Maisaka SDK 的 B 站视频解析插件。"""
 
-    # 插件基本信息
-    plugin_name: str = "bilibili_video_parser"
-    enable_plugin: bool = False
-    dependencies: List[str] = []
-    python_dependencies: List[str] = ["aiohttp>=3.8.0"]
-    config_file_name: str = "config.toml"
+    config_model = BilibiliVideoParserConfig
+    _BILIBILI_TEXT_MARKERS = (
+        "bilibili.com/video/",
+        "b23.tv/",
+        "b23.tv",
+        "哔哩哔哩：",
+        "[小程序]",
+        "[json",
+        "[xml]",
+        "[share]",
+    )
 
-    # 配置节描述
-    config_section_descriptions = {
-        "plugin": "插件基本信息",
-        "trigger": "触发方式配置",
-        "summary": "总结生成配置",
-        "video": "视频处理配置",
-        "analysis": "视觉分析配置",
-        "analysis.default": "Default模式配置（使用MaiBot VLM）",
-        "analysis.builtin": "Builtin模式配置（使用插件内置VLM，支持动态参数传递）",
-        "analysis.doubao": "Doubao模式配置（使用豆包视频模型，支持动态参数传递）",
-    }
+    def __init__(self) -> None:
+        super().__init__()
+        self._plugin_dir = Path(__file__).resolve().parent
+        self._data_dir = self._plugin_dir / "data"
+        self._cache_dir = self._data_dir / "cache"
+        self._temp_dir = self._data_dir / "temp"
+        self._message_formatter = MessageFormatter()
+        self._hook_injector = HookInjector(self._message_formatter)
+        self._command_parser = CommandRequestParser()
+        self._auto_detect_result_service = None
+        self._command_result_service = None
+        self._host_llm_adapter: LLMHostAdapter | None = None
+        self._napcat_resolver = None
+        self._pipeline: VideoPipeline | None = None
+        self._metadata_service = MetadataService()
+        self._subtitle_service = SubtitleService()
+        self._visual_service = VisualService()
+        self._text_render_service = TextRenderService()
+        self._summary_service = None
+        self._video_analyzer: VideoAnalyzer | None = None
+        self._video_parser: VideoParser | None = None
+        self._cache_manager = CacheManager(self._cache_dir)
+        self._host_task_snapshot: set[str] = set()
+        self._cleanup_task = None
 
-    # 配置Schema定义
-    config_schema: dict = {
-        "plugin": {
-            "config_version": ConfigField(
-                type=str,
-                default="3.2.0",
-                description="配置文件版本"
-            ),
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用插件"
-            ),
-        },
-        "trigger": {
-            "auto_detect_enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否自动检测B站链接（用户发送链接时自动解析）"
-            ),
-            "command_enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用命令触发（/bili 命令）"
-            ),
-        },
-        "summary": {
-            "enable_summary": ConfigField(
-                type=bool,
-                default=True,
-                description="是否生成最终总结。开启时会调用模型生成总结；关闭时直接将原生视频信息发送给回复系统"
-            ),
-            "summary_max_chars": ConfigField(
-                type=int,
-                default=200,
-                description="总结最大字数。范围60-2000，建议保持默认值200（过长会导致消息被MaiBot截断）"
-            ),
-        },
-        "video": {
-            "max_duration_min": ConfigField(
-                type=float,
-                default=60.0,
-                description="视频最大时长(分钟)，超过此时长的视频将被跳过不处理"
-            ),
-            "max_size_mb": ConfigField(
-                type=int,
-                default=300,
-                description="视频最大文件大小(MB)，超过此大小的视频将被跳过"
-            ),
-            "sessdata": ConfigField(
-                type=str,
-                default="",
-                description="B站SESSDATA Cookie（可选，用于获取字幕）。不填写时将跳过字幕获取"
-            ),
-            "ffmpeg_path": ConfigField(
-                type=str,
-                default="",
-                description="ffmpeg路径（可选）。Windows 可填写 ffmpeg 的 bin 目录或 ffmpeg(.exe) 完整路径；留空时自动从系统 PATH 检测"
-            ),
-            "enable_asr": ConfigField(
-                type=bool,
-                default=False,
-                description="是否启用ASR语音识别（可选）。开启后会从视频音轨中提取语音进行识别，作为字幕的补充"
-            ),
-            "cache_enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用视频解析结果缓存。开启后，相同视频不会重复解析"
-            ),
-            "temp_file_max_age_min": ConfigField(
-                type=int,
-                default=60,
-                description="临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除"
-            ),
-            "download_timeout_sec": ConfigField(
-                type=int,
-                default=300,
-                description="视频下载超时时间（秒）。用于从B站下载视频文件，超时后降级到字幕模式或基础信息模式"
-            ),
-            "retry_max_attempts": ConfigField(
-                type=int,
-                default=3,
-                description="B站API请求最大重试次数。用于获取视频信息、字幕、下载地址等B站接口调用"
-            ),
-            "retry_interval_sec": ConfigField(
-                type=float,
-                default=2.0,
-                description="B站API请求重试间隔（秒）"
-            ),
-        },
-        "analysis": {
-            "visual_method": ConfigField(
-                type=str,
-                default="default",
-                description="视觉分析方式：default（使用MaiBot主程序的VLM）、builtin（使用插件内置VLM）、doubao（使用豆包视频模型）或 none（不进行视觉分析）"
-            ),
-        },
-        "analysis.default": {
-            "visual_max_duration_min": ConfigField(
-                type=float,
-                default=10.0,
-                description="进行视觉分析的最大视频时长(分钟)。超过此时长的视频将只使用字幕+ASR+视频信息，不进行视觉分析"
-            ),
-            "lock_max_frames_5": ConfigField(
-                type=bool,
-                default=True,
-                description="是否锁定为固定等距抽5帧。true时固定等距抽5帧（最多5帧）；false时按frame_interval_sec动态计算等距抽帧；若时长未知则降级到固定5帧逻辑"
-            ),
-            "frame_interval_sec": ConfigField(
-                type=int,
-                default=10,
-                description="抽帧间隔(秒)。仅在lock_max_frames_5=false时生效，用于按视频时长动态计算等距抽帧数量"
-            ),
-            "frame_prompt": ConfigField(
-                type=str,
-                default="",
-                description="自定义帧分析提示词（留空使用默认提示词）"
-            ),
-            "parallel_frame_analysis": ConfigField(
-                type=bool,
-                default=False,
-                description="是否并发进行关键帧识别。false时保持旧逻辑：逐帧串行识别；true时启用并发（受parallel_frame_analysis_limit限制）"
-            ),
-            "parallel_frame_analysis_limit": ConfigField(
-                type=int,
-                default=2,
-                description="并发关键帧识别的最大并发数（仅parallel_frame_analysis=true时生效）。建议1-5，值越大速度越快但更容易触发模型/服务限流"
-            ),
-        },
-        "analysis.builtin": {
-            "visual_max_duration_min": ConfigField(
-                type=float,
-                default=10.0,
-                description="进行视觉分析的最大视频时长(分钟)。超过此时长的视频将只使用字幕+ASR+视频信息，不进行视觉分析"
-            ),
-            "lock_max_frames_5": ConfigField(
-                type=bool,
-                default=True,
-                description="是否锁定为固定等距抽5帧。true时固定等距抽5帧（最多5帧）；false时按frame_interval_sec动态计算等距抽帧；若时长未知则降级到固定5帧逻辑"
-            ),
-            "frame_interval_sec": ConfigField(
-                type=int,
-                default=10,
-                description="抽帧间隔(秒)。仅在lock_max_frames_5=false时生效，用于按视频时长动态计算等距抽帧数量"
-            ),
-            "client_type": ConfigField(
-                type=str,
-                default="openai",
-                description="API服务类型：openai（兼容OpenAI格式）或 gemini（Google Gemini格式）"
-            ),
-            "base_url": ConfigField(
-                type=str,
-                default="https://api.siliconflow.cn/v1",
-                description="API基础URL"
-            ),
-            "api_key": ConfigField(
-                type=str,
-                default="",
-                description="API密钥"
-            ),
-            "model": ConfigField(
-                type=str,
-                default="Qwen/Qwen2.5-VL-72B-Instruct",
-                description="模型标识符（API服务商提供的模型ID）"
-            ),
-            "timeout": ConfigField(
-                type=int,
-                default=60,
-                description="VLM API请求超时时间（秒）。用于帧图片分析请求"
-            ),
-            "max_retries": ConfigField(
-                type=int,
-                default=2,
-                description="VLM API请求最大重试次数。用于帧图片分析失败后的重试"
-            ),
-            "retry_interval": ConfigField(
-                type=int,
-                default=5,
-                description="VLM API请求重试间隔（秒）"
-            ),
-            "frame_prompt": ConfigField(
-                type=str,
-                default="",
-                description="自定义帧分析提示词（留空使用默认提示词）"
-            ),
-            "parallel_frame_analysis": ConfigField(
-                type=bool,
-                default=False,
-                description="是否并发进行关键帧识别。false时保持旧逻辑：逐帧串行识别；true时启用并发（受parallel_frame_analysis_limit限制）"
-            ),
-            "parallel_frame_analysis_limit": ConfigField(
-                type=int,
-                default=2,
-                description="并发关键帧识别的最大并发数（仅parallel_frame_analysis=true时生效）。建议1-5，值越大速度越快但更容易触发模型/服务限流"
-            ),
-        },
-        "analysis.doubao": {
-            "visual_max_duration_min": ConfigField(
-                type=float,
-                default=10.0,
-                description="进行视觉分析的最大视频时长(分钟)。超过此时长的视频将只使用字幕+ASR+视频信息，不进行视觉分析"
-            ),
-            "api_key": ConfigField(
-                type=str,
-                default="",
-                description="豆包API密钥（也可通过环境变量 ARK_API_KEY 设置）"
-            ),
-            "model_id": ConfigField(
-                type=str,
-                default="doubao-seed-1-6-flash-250828",
-                description="豆包模型ID"
-            ),
-            "fps": ConfigField(
-                type=float,
-                default=1.0,
-                description="抽帧频率（0.2-5），值越高理解越精细但token消耗越大"
-            ),
-            "base_url": ConfigField(
-                type=str,
-                default="https://ark.cn-beijing.volces.com/api/v3",
-                description="豆包API基础URL"
-            ),
-            "timeout": ConfigField(
-                type=int,
-                default=120,
-                description="豆包API请求超时时间（秒）。包含视频上传和分析返回的总时间，建议设置较长"
-            ),
-            "max_retries": ConfigField(
-                type=int,
-                default=2,
-                description="豆包API请求最大重试次数。用于视频分析失败后的重试"
-            ),
-            "retry_interval": ConfigField(
-                type=int,
-                default=10,
-                description="豆包API请求重试间隔（秒）。豆包服务可能需要较长恢复时间，建议设置较长"
-            ),
-            "summary_min_chars": ConfigField(
-                type=int,
-                default=100,
-                description="豆包视频分析最小字数"
-            ),
-            "summary_max_chars": ConfigField(
-                type=int,
-                default=150,
-                description="豆包视频分析最大字数"
-            ),
-            "video_prompt": ConfigField(
-                type=str,
-                default="",
-                description="自定义视频分析提示词（留空使用默认提示词）。提示词中可使用 {summary_min_chars} 和 {summary_max_chars} 占位符"
-            ),
-        },
-    }
-
-    def __init__(self, plugin_dir: str, **kwargs):
-        super().__init__(plugin_dir, **kwargs)
-        
-        # 读取 plugin.enabled 配置，设置插件启用状态
-        # 注意：必须在 super().__init__() 之后，因为配置系统在父类中初始化
-        self.enable_plugin = self.get_config("plugin.enabled", True)
-        
-        # 初始化管理器实例（在__init__中初始化，确保get_plugin_components可以使用）
-        plugin_path = Path(__file__).parent
-        data_dir = plugin_path / "data"
-        
-        # 初始化目录结构
-        # data/
-        # ├── index.json          # 缓存索引
-        # ├── cache/              # 视频解析结果缓存
-        # │   └── *.json          # 每个视频的缓存数据
-        # └── temp/               # 临时文件目录
-        #     ├── videos/         # 临时视频文件
-        #     ├── frames/         # 临时帧图片目录
-        #     └── audio/          # 临时音频文件
-        
-        # 初始化安全删除模块的临时目录
-        init_temp_dir(str(data_dir))
-        
-        self.cache_manager = CacheManager(str(data_dir))
-
-        ffmpeg_path = self.get_config("video.ffmpeg_path", "")
-        if isinstance(ffmpeg_path, str):
-            ffmpeg_path = ffmpeg_path.strip()
-        else:
-            ffmpeg_path = ""
-
-        self.video_parser = VideoParser(
-            ffmpeg_path=ffmpeg_path or None,
-            data_dir=str(data_dir)
+    async def on_load(self) -> None:
+        self._ensure_runtime_dirs()
+        init_temp_dir(str(self._data_dir))
+        self._refresh_logger_level()
+        self._video_parser = VideoParser(
+            self.config.video.ffmpeg_path,
+            ffmpeg_probe_timeout_sec=self.config.video.ffmpeg_probe_timeout_sec,
+            ffmpeg_extract_audio_timeout_sec=self.config.video.ffmpeg_extract_audio_timeout_sec,
+            ffmpeg_extract_frames_timeout_sec=self.config.video.ffmpeg_extract_frames_timeout_sec,
         )
-        
-        # 获取VLM配置（根据visual_method决定使用哪个配置）
-        vlm_config = self._get_vlm_config()
-        self.video_analyzer = VideoAnalyzer(vlm_config=vlm_config)  # 采用懒加载，首次使用时自动初始化
-        
-        # 检查ffmpeg（同步操作）
-        if self.video_parser.check_ffmpeg():
-            logger.debug("[BilibiliVideoParser] ffmpeg检查成功")
+        self._host_llm_adapter = self._build_host_llm_adapter()
+        self._summary_service = self._build_summary_service()
+        self._auto_detect_result_service = self._build_auto_detect_result_service()
+        self._command_result_service = self._build_command_result_service()
+        self._napcat_resolver = NapCatBilibiliResolver(self.ctx)
+        self._video_analyzer = self._build_video_analyzer()
+        self._pipeline = self._build_pipeline()
+        await self._refresh_host_task_snapshot()
+        await self._start_cleanup_task_after_delay()
+        self.ctx.logger.info(
+            "B站视频解析插件已加载: enabled=%s, visual_method=%s, summary_enabled=%s",
+            self.config.plugin.enabled,
+            self.config.analysis.visual_method,
+            self.config.summary.enabled,
+        )
+
+    async def on_unload(self) -> None:
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            self._cleanup_task = None
+        self._host_task_snapshot.clear()
+        self._host_llm_adapter = None
+
+    async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
+        del config_data
+        del version
+        if scope == "self":
+            self._refresh_logger_level()
+            self._video_parser = VideoParser(
+                self.config.video.ffmpeg_path,
+                ffmpeg_probe_timeout_sec=self.config.video.ffmpeg_probe_timeout_sec,
+                ffmpeg_extract_audio_timeout_sec=self.config.video.ffmpeg_extract_audio_timeout_sec,
+                ffmpeg_extract_frames_timeout_sec=self.config.video.ffmpeg_extract_frames_timeout_sec,
+            )
+            self._host_llm_adapter = self._build_host_llm_adapter()
+            self._summary_service = self._build_summary_service()
+            self._auto_detect_result_service = self._build_auto_detect_result_service()
+            self._command_result_service = self._build_command_result_service()
+            self._napcat_resolver = NapCatBilibiliResolver(self.ctx)
+            self._video_analyzer = self._build_video_analyzer()
+            self._pipeline = self._build_pipeline()
+            await self._refresh_host_task_snapshot()
+            self.ctx.logger.info(
+                "B站视频解析插件配置已刷新: enabled=%s, summary_enabled=%s",
+                self.config.plugin.enabled,
+                self.config.auto_detect.enable_summary,
+            )
+
+    @HookHandler(
+        "chat.receive.after_process",
+        name="bilibili_auto_detect",
+        description="自动检测消息中的 B 站链接并注入上下文",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+        timeout_ms=HOOK_TIMEOUT_MS,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_auto_detect(self, **kwargs: Any) -> dict[str, Any]:
+        if not self.config.plugin.enabled or not self.config.trigger.auto_detect_enabled:
+            return self._hook_injector.pass_through().to_hook_result()
+
+        message = kwargs.get("message")
+        if message is None:
+            return self._hook_injector.pass_through().to_hook_result()
+
+        stream_id = str(kwargs.get("stream_id", "") or "")
+        message_context = MessageContextBuilder.build(message, stream_id=stream_id)
+        session_id = message_context.effective_stream_id
+        if not session_id:
+            self.ctx.logger.warning(
+                "自动检测跳过：缺少 session_id，无法建立稳定上下文: message_id=%s, platform=%s, fallback_stream_id=%s",
+                message_context.message_id,
+                message_context.platform,
+                message_context.stream_id,
+            )
+            return self._hook_injector.pass_through().to_hook_result()
+
+        if not self._allow_auto_detect_for_message(message_context):
+            return self._hook_injector.pass_through().to_hook_result()
+
+        if self._looks_like_bili_command(message_context.processed_plain_text, message_context.plain_text):
+            self.ctx.logger.debug(
+                "自动检测跳过：当前消息已命中 /bili 指令，由命令链独占处理: message_id=%s, session_id=%s",
+                message_context.message_id,
+                session_id,
+            )
+            return self._hook_injector.pass_through().to_hook_result()
+
+        if not self._should_attempt_bilibili_detect(message_context):
+            self.ctx.logger.debug(
+                "自动检测跳过：普通消息未命中 B 站门禁: message_id=%s, session_id=%s",
+                message_context.message_id,
+                session_id,
+            )
+            return self._hook_injector.pass_through().to_hook_result()
+
+        if not message_context.processed_plain_text.strip() and not message_context.raw_segments:
+            self.ctx.logger.debug("自动检测跳过：processed_plain_text 为空")
+
+        if self._pipeline is None:
+            return self._hook_injector.pass_through().to_hook_result()
+
+        if self._napcat_resolver is None:
+            return self._hook_injector.pass_through().to_hook_result()
+
+        resolved_target = await self._napcat_resolver.resolve(message_context)
+        if resolved_target is None:
+            self.ctx.logger.debug("自动检测跳过：未识别到有效视频引用")
+            return self._hook_injector.pass_through().to_hook_result()
+
+        video_ref = self._metadata_service.locate(resolved_target.source_text)
+        if video_ref is None:
+            video_ref = self._metadata_service.locate(resolved_target.video_id)
+        if video_ref is None:
+            self.ctx.logger.debug("自动检测跳过：解析结果未能构造视频引用")
+            return self._hook_injector.pass_through().to_hook_result()
+
+        video_ref.video_id = resolved_target.video_id
+        video_ref.page = resolved_target.page
+        video_ref.source = resolved_target.video_type
+
+        self.ctx.logger.info(
+            "自动检测命中 B 站视频: video_id=%s, page=%s, source_kind=%s, message_id=%s, session_id=%s",
+            video_ref.video_id,
+            video_ref.page,
+            resolved_target.source_kind,
+            message_context.message_id,
+            session_id,
+        )
+
+        card_visual_text = ""
+        auto_detect_state: dict[str, Any] = {"latest_result": None}
+        try:
+            card_visual_text = await self._resolve_card_visual_texts(message_context.card_visual_hashes)
+            result = await self._run_auto_detect_pipeline(
+                video_ref,
+                card_visual_text=card_visual_text,
+                state=auto_detect_state,
+            )
+            auto_detect_state["latest_result"] = result
+            if self._auto_detect_result_service is None:
+                raise RuntimeError("自动检测结果装配服务未初始化")
+            result_snapshot = self._auto_detect_result_service.describe_result(result)
+            rewritten_text = self._auto_detect_result_service.build_success_text(
+                original_text=self._get_message_visible_text(message_context.raw_message),
+                result=result,
+            )
+            self.ctx.logger.info(
+                "自动检测完整分析完成: video_id=%s, message_id=%s, session_id=%s, output_length=%s, result_level=%s, has_metadata=%s, has_raw_info=%s, has_summary=%s, fallback_reason=%s",
+                video_ref.video_id,
+                message_context.message_id,
+                session_id,
+                len(rewritten_text),
+                result_snapshot["result_level"],
+                result_snapshot["has_metadata"],
+                result_snapshot["has_raw_info"],
+                result_snapshot["has_summary"],
+                result_snapshot["fallback_reason"],
+            )
+        except asyncio.TimeoutError:
+            if self._auto_detect_result_service is None:
+                raise RuntimeError("自动检测结果装配服务未初始化")
+            timeout_result = None
+            timeout_snapshot = self._auto_detect_result_service.describe_result(timeout_result)
+            rewritten_text = self._auto_detect_result_service.build_fallback_text(
+                original_text=self._get_message_visible_text(message_context.raw_message),
+                video_ref=video_ref,
+                result=timeout_result,
+            )
+            self.ctx.logger.warning(
+                "自动检测完整分析超时，已降级输出: video_id=%s, timeout_sec=%s, session_id=%s, result_level=%s, has_metadata=%s, has_raw_info=%s, has_summary=%s, fallback_reason=%s",
+                video_ref.video_id,
+                self.config.trigger_timeout.auto_detect_total_timeout_sec,
+                session_id,
+                timeout_snapshot["result_level"],
+                timeout_snapshot["has_metadata"],
+                timeout_snapshot["has_raw_info"],
+                timeout_snapshot["has_summary"],
+                timeout_snapshot["fallback_reason"],
+            )
+        except Exception:
+            if self._auto_detect_result_service is None:
+                raise RuntimeError("自动检测结果装配服务未初始化")
+            failure_result = auto_detect_state.get("latest_result")
+            if failure_result is not None and not failure_result.fallback_reason:
+                failure_result.fallback_reason = "auto_detect_system_exception"
+            failure_snapshot = self._auto_detect_result_service.describe_result(failure_result)
+            rewritten_text = self._auto_detect_result_service.build_fallback_text(
+                original_text=self._get_message_visible_text(message_context.raw_message),
+                video_ref=video_ref,
+                result=failure_result,
+            )
+            self.ctx.logger.error(
+                "自动检测完整分析失败，已降级输出: video_id=%s, session_id=%s, result_level=%s, has_metadata=%s, has_raw_info=%s, has_summary=%s, fallback_reason=%s",
+                video_ref.video_id,
+                session_id,
+                failure_snapshot["result_level"],
+                failure_snapshot["has_metadata"],
+                failure_snapshot["has_raw_info"],
+                failure_snapshot["has_summary"],
+                failure_snapshot["fallback_reason"],
+                exc_info=True,
+            )
+
+        decision = self._hook_injector.rewrite_text(kwargs=kwargs, rewritten_text=rewritten_text)
+        self.ctx.logger.info(
+            "自动检测消息已重写到 Maisaka 消费层: message_id=%s, session_id=%s, raw_message_rewritten=%s",
+            message_context.message_id,
+            session_id,
+            True,
+        )
+        return decision.to_hook_result()
+
+    @Command("bili", description="解析 B 站视频", pattern=r"^/bili(?:\s+.+)?$", timeout_ms=600000)
+    async def handle_bili_command(self, stream_id: str = "", message: Any = None, **kwargs: Any):
+        del kwargs
+        if not self.config.plugin.enabled or not self.config.trigger.command_enabled:
+            return False, "插件未启用命令模式", False
+
+        message_context = MessageContextBuilder.build(message, stream_id=stream_id) if message is not None else None
+        reply_stream_id = stream_id or (message_context.effective_stream_id if message_context is not None else "")
+        raw_text = self._extract_command_text(message_context.raw_message if message_context is not None else message)
+        try:
+            invocation = self._command_parser.parse(
+                raw_text,
+                allow_extra_arguments=self.config.command.allow_extra_arguments,
+                allow_force_visual=self.config.command.allow_force_visual,
+                allow_force_asr=self.config.command.allow_force_asr,
+            )
+        except ValueError as exc:
+            error_text = self._message_formatter.build_command_error_text(str(exc))
+            await self.ctx.send.text(error_text, reply_stream_id)
+            return False, error_text, True
+
+        if self.config.command.show_processing_message:
+            await self.ctx.send.text(self._message_formatter.build_processing_text(), reply_stream_id)
+
+        if self._pipeline is None:
+            error_text = self._message_formatter.build_command_error_text("流水线未初始化")
+            await self.ctx.send.text(error_text, reply_stream_id)
+            return False, error_text, True
+
+        video_ref = self._metadata_service.locate(invocation.url_or_id)
+        if video_ref is None:
+            error_text = self._message_formatter.build_command_error_text("未识别到有效的 B 站视频链接或视频 ID")
+            await self.ctx.send.text(error_text, reply_stream_id)
+            return False, error_text, True
+
+        try:
+            result = await asyncio.wait_for(
+                self._run_pipeline(
+                    video_ref,
+                    force_summary=self.config.summary.enabled,
+                    command_force_visual=invocation.options.force_visual,
+                    command_force_asr=invocation.options.force_asr,
+                    card_visual_text=(
+                        await self._resolve_card_visual_texts(message_context.card_visual_hashes)
+                        if message_context is not None
+                        else ""
+                    ),
+                ),
+                timeout=max(1, int(self.config.trigger_timeout.command_total_timeout_sec)),
+            )
+        except asyncio.TimeoutError:
+            error_text = self._message_formatter.build_command_error_text(
+                f"命令链执行超时（>{int(self.config.trigger_timeout.command_total_timeout_sec)}秒）"
+            )
+            await self.ctx.send.text(error_text, reply_stream_id)
+            return False, error_text, True
+        if self._command_result_service is None:
+            raise RuntimeError("指令结果装配服务未初始化")
+        response_text = self._command_result_service.build_result_text(result)
+        output_snapshot = self._command_result_service.describe_output(result)
+        self.ctx.logger.info(
+            "指令结果装配完成: output_level=%s, summary_used=%s, raw_info_used=%s, metadata_used=%s, summary_failed=%s",
+            output_snapshot["output_level"],
+            output_snapshot["summary_used"],
+            output_snapshot["raw_info_used"],
+            output_snapshot["metadata_used"],
+            output_snapshot["summary_failed"],
+        )
+        await self.ctx.send.text(response_text, reply_stream_id)
+        return True, "命令执行完成", True
+
+    def _ensure_runtime_dirs(self) -> None:
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._temp_dir.mkdir(parents=True, exist_ok=True)
+
+    def _refresh_logger_level(self) -> None:
+        logger_level = logging.DEBUG if self.config.plugin.debug else getattr(logging, self.config.plugin.log_level, logging.INFO)
+        self.ctx.logger.setLevel(logger_level)
+
+    def _build_host_llm_adapter(self) -> LLMHostAdapter:
+        timeout_policy = HostTimeoutPolicy(
+            enabled=self.config.host_timeout.enabled,
+            request_timeout_min=self.config.host_timeout.task_request_timeout_min,
+        )
+        return LLMHostAdapter(
+            self.ctx,
+            timeout_policy=timeout_policy,
+        )
+
+    def _build_pipeline(self) -> VideoPipeline:
+        if self._video_parser is None:
+            raise RuntimeError("视频解析器未初始化")
+        provider = None
+        if self.config.asr.enabled:
+            if self.config.asr.provider_type != "openai_compatible":
+                raise RuntimeError(f"不支持的 ASR provider_type: {self.config.asr.provider_type}")
+            provider = OpenAICompatibleAsrProvider(
+                base_url=self.config.asr.base_url,
+                api_key=self.config.asr.api_key,
+                model=self.config.asr.model,
+                timeout_sec=self.config.asr.timeout_sec,
+                max_retries=self.config.asr.max_retries,
+                retry_interval_sec=self.config.asr.retry_interval_sec,
+                language=self.config.asr.language,
+                prompt=self.config.asr.prompt,
+            )
+        deps = PipelineDependencies(
+            metadata_service=self._metadata_service,
+            video_parser=self._video_parser,
+            video_analyzer=self._video_analyzer,
+            subtitle_service=self._subtitle_service,
+            visual_service=self._visual_service,
+            summary_service=self._summary_service,
+            text_render_service=self._text_render_service,
+            asr_service=AsrService(provider),
+            host_llm_adapter=self._host_llm_adapter,
+            cache_manager=self._cache_manager,
+        )
+        return VideoPipeline(deps)
+
+    def _build_video_analyzer(self) -> VideoAnalyzer:
+        host_config = self.config.analysis.host.model_dump(mode="python")
+        host_config["host_task_name"] = self.config.analysis.host.host_task_name
+        return VideoAnalyzer(host_llm_adapter=self._host_llm_adapter, vlm_config=host_config)
+
+    def _build_summary_service(self):
+        from .core.summary_service import SummaryService
+
+        return SummaryService(self._text_render_service, self._host_llm_adapter)
+
+    def _build_auto_detect_result_service(self) -> AutoDetectResultService:
+        return AutoDetectResultService(self._message_formatter, self._text_render_service)
+
+    def _build_command_result_service(self) -> CommandResultService:
+        if self._summary_service is None:
+            raise RuntimeError("视频总结服务未初始化")
+        return CommandResultService(self._summary_service)
+
+    async def _run_pipeline(
+        self,
+        video_ref,
+        *,
+        force_summary: bool | None = None,
+        command_force_visual: bool = False,
+        command_force_asr: bool = False,
+        card_visual_text: str = "",
+    ):
+        if self._pipeline is None:
+            raise RuntimeError("流水线未初始化")
+        pipeline_config = self._build_pipeline_config(
+            force_summary=force_summary,
+            command_force_visual=command_force_visual,
+            command_force_asr=command_force_asr,
+            card_visual_text=card_visual_text,
+        )
+        return await self._pipeline.run(video_ref, pipeline_config)
+
+    def _build_pipeline_config(
+        self,
+        *,
+        force_summary: bool | None,
+        command_force_visual: bool = False,
+        command_force_asr: bool = False,
+        card_visual_text: str = "",
+    ) -> PipelineConfig:
+        effective_visual_method = self.config.analysis.visual_method
+        summary_enabled = self.config.summary.enabled
+        if self._host_llm_adapter is not None:
+            preferred_visual_task_name = self._host_llm_adapter.resolve_preferred_task(
+                self.config.analysis.host.host_task_name,
+                ["vlm", "replyer"],
+                allow_fallback=False,
+            )
+            preferred_summary_task_name = self._host_llm_adapter.resolve_preferred_task(
+                self.config.summary.host_task_name,
+                ["replyer", "planner"],
+                allow_fallback=False,
+            )
         else:
-            logger.warning("[BilibiliVideoParser] ffmpeg不可用，视频解析功能将受限")
-        
-        # 定时清理任务句柄
-        self._cleanup_task: Optional[asyncio.Task] = None
-        
-        # 启动定时清理任务（延迟启动，确保插件完全初始化）
-        asyncio.create_task(self._start_cleanup_task_after_delay())
-        
-        logger.info("[BilibiliVideoParser] 插件初始化完成")
-    
-    def _get_vlm_config(self) -> dict:
-        """获取VLM配置（根据visual_method决定使用哪个配置）
-        
-        对于builtin模式，采用动态参数传递策略：
-        - 只传递用户在配置文件中实际定义的参数
-        - 不同API服务商可能支持不同的参数
-        - 用户可以自由添加服务商特有的参数
-        """
-        visual_method = self.get_config("analysis.visual_method", "default")
-        
-        # 基础配置
-        config = {
-            "visual_method": visual_method,
+            preferred_visual_task_name = self.config.analysis.host.host_task_name
+            preferred_summary_task_name = self.config.summary.host_task_name
+        if effective_visual_method == "host" and preferred_visual_task_name not in self._host_task_snapshot:
+            self.ctx.logger.warning(
+                "宿主视觉任务不可用，已降级为 none: configured_task=%s",
+                preferred_visual_task_name,
+            )
+            effective_visual_method = "none"
+        if summary_enabled and preferred_summary_task_name not in self._host_task_snapshot:
+            self.ctx.logger.warning(
+                "宿主总结任务不可用，已关闭总结阶段: configured_task=%s",
+                preferred_summary_task_name,
+            )
+            summary_enabled = False
+        if force_summary is None:
+            force_summary = self.config.auto_detect.enable_summary and summary_enabled
+        cache_fingerprint = self._build_cache_fingerprint(
+            effective_visual_method=effective_visual_method,
+            effective_visual_task_name=preferred_visual_task_name,
+            summary_enabled=summary_enabled,
+            effective_summary_task_name=preferred_summary_task_name,
+        )
+        self.ctx.logger.info(
+            "流水线配置生效: configured_visual_method=%s, effective_visual_method=%s, configured_visual_task=%s, effective_visual_task=%s, configured_summary_enabled=%s, effective_summary_enabled=%s, configured_summary_task=%s, effective_summary_task=%s, cache_fingerprint=%s",
+            self.config.analysis.visual_method,
+            effective_visual_method,
+            self.config.analysis.host.host_task_name,
+            preferred_visual_task_name,
+            self.config.summary.enabled,
+            summary_enabled,
+            self.config.summary.host_task_name,
+            preferred_summary_task_name,
+            cache_fingerprint,
+        )
+        return PipelineConfig(
+            auto_detect_enable_summary=force_summary,
+            summary_enabled=summary_enabled,
+            summary_fallback_to_raw_info=self.config.summary.fallback_to_raw_info,
+            summary_custom_prompt=self.config.summary.custom_prompt,
+            summary_max_chars=self.config.summary.summary_max_chars,
+            visual_method=effective_visual_method,
+            cache_enabled=self.config.cache.enabled,
+            cleanup_on_success=self.config.cache.cleanup_on_success,
+            sessdata=self.config.video.sessdata,
+            max_duration_min=self.config.video.max_duration_min,
+            max_size_mb=self.config.video.max_size_mb,
+            visual_max_duration_min=self.config.analysis.visual_max_duration_min,
+            max_frames=self.config.analysis.max_frames,
+            lock_even_frames=self.config.analysis.lock_even_frames,
+            frame_interval_sec=self.config.analysis.frame_interval_sec,
+            visual_prompt=self._get_visual_prompt(),
+            host_task_name=preferred_visual_task_name,
+            host_temperature=self.config.analysis.host.temperature,
+            host_max_tokens=self.config.analysis.host.max_tokens,
+            summary_task_name=preferred_summary_task_name,
+            summary_temperature=self.config.summary.temperature,
+            summary_max_tokens=self.config.summary.max_tokens,
+            asr_config=self.config.asr.model_dump(mode="python"),
+            video_api_timeout_sec=self.config.video.api_timeout_sec,
+            short_url_timeout_sec=self.config.video.short_url_timeout_sec,
+            subtitle_timeout_sec=self.config.video.subtitle_timeout_sec,
+            download_url_timeout_sec=self.config.video.download_url_timeout_sec,
+            download_timeout_sec=self.config.video.download_timeout_sec,
+            ffmpeg_probe_timeout_sec=self.config.video.ffmpeg_probe_timeout_sec,
+            ffmpeg_extract_audio_timeout_sec=self.config.video.ffmpeg_extract_audio_timeout_sec,
+            ffmpeg_extract_frames_timeout_sec=self.config.video.ffmpeg_extract_frames_timeout_sec,
+            media_pipeline_timeout_sec=self.config.video.media_pipeline_timeout_sec,
+            retry_max_attempts=self.config.video.retry_max_attempts,
+            retry_interval_sec=self.config.video.retry_interval_sec,
+            temp_file_max_age_min=self.config.cache.temp_file_max_age_min,
+            parallel_frame_analysis=self.config.analysis.parallel_frame_analysis,
+            parallel_frame_analysis_limit=self.config.analysis.parallel_frame_analysis_limit,
+            command_force_visual=command_force_visual,
+            command_force_asr=command_force_asr,
+            cache_summary=self.config.cache.cache_summary,
+            cache_raw_info=self.config.cache.cache_raw_info,
+            cache_visual_result=self.config.cache.cache_visual_result,
+            cache_subtitle=self.config.cache.cache_subtitle,
+            cache_asr=self.config.cache.cache_asr,
+            asr_max_audio_duration_min=self.config.asr.max_audio_duration_min,
+            card_visual_text=card_visual_text,
+            cache_fingerprint=cache_fingerprint,
+        )
+
+    async def _run_auto_detect_pipeline(self, video_ref, *, card_visual_text: str = "", state: dict[str, Any] | None = None):
+        if self._pipeline is None:
+            raise RuntimeError("流水线未初始化")
+
+        timeout_sec = max(1, int(self.config.trigger_timeout.auto_detect_total_timeout_sec))
+        pipeline_config = self._build_pipeline_config(
+            force_summary=self.config.auto_detect.enable_summary and self.config.summary.enabled,
+            card_visual_text=card_visual_text,
+        )
+        started_at = monotonic()
+        prepared_result = await asyncio.wait_for(
+            self._pipeline.prepare_metadata_result(video_ref, pipeline_config),
+            timeout=timeout_sec,
+        )
+        if state is not None:
+            state["latest_result"] = prepared_result
+        remaining_timeout = timeout_sec - (monotonic() - started_at)
+        if remaining_timeout <= 0:
+            prepared_result.success = False
+            prepared_result.fallback_reason = "auto_detect_total_timeout"
+            return prepared_result
+        try:
+            enriched_result = await asyncio.wait_for(
+                self._pipeline.enrich_result(prepared_result, pipeline_config),
+                timeout=max(0.1, remaining_timeout),
+            )
+            if state is not None:
+                state["latest_result"] = enriched_result
+        except asyncio.TimeoutError:
+            prepared_result.success = False
+            prepared_result.fallback_reason = "auto_detect_total_timeout"
+            if state is not None:
+                state["latest_result"] = prepared_result
+            return prepared_result
+        if not enriched_result.fallback_reason and enriched_result.result_level == "metadata":
+            enriched_result.fallback_reason = prepared_result.fallback_reason
+        return enriched_result
+
+    def _build_cache_fingerprint(
+        self,
+        *,
+        effective_visual_method: str,
+        effective_visual_task_name: str,
+        summary_enabled: bool,
+        effective_summary_task_name: str,
+    ) -> str:
+        payload = {
+            "visual_method": effective_visual_method,
+            "visual_task": effective_visual_task_name,
+            "visual_prompt": self.config.analysis.host.frame_prompt,
+            "summary_enabled": summary_enabled,
+            "summary_task": effective_summary_task_name,
+            "summary_prompt": self.config.summary.custom_prompt,
+            "summary_max_chars": self.config.summary.summary_max_chars,
+            "summary_max_tokens": self.config.summary.max_tokens,
+            "summary_temperature": self.config.summary.temperature,
+            "summary_fallback_to_raw_info": self.config.summary.fallback_to_raw_info,
+            "asr_enabled": self.config.asr.enabled,
+            "cache_visual_result": self.config.cache.cache_visual_result,
+            "cache_subtitle": self.config.cache.cache_subtitle,
+            "cache_asr": self.config.cache.cache_asr,
+            "cache_summary": self.config.cache.cache_summary,
+            "output_schema_version": "2",
         }
-        
-        if visual_method == "builtin":
-            # 使用插件内置VLM配置
-            # 动态获取所有builtin配置项，让用户自由定义参数
-            config["use_builtin"] = True
-            
-            # 必需参数（有默认值）
-            config["client_type"] = self.get_config("analysis.builtin.client_type", "openai")
-            config["base_url"] = self.get_config("analysis.builtin.base_url", "https://api.siliconflow.cn/v1")
-            config["api_key"] = self.get_config("analysis.builtin.api_key", "")
-            config["model"] = self.get_config("analysis.builtin.model", "Qwen/Qwen2.5-VL-72B-Instruct")
-            config["timeout"] = self.get_config("analysis.builtin.timeout", 60)
-            config["max_retries"] = self.get_config("analysis.builtin.max_retries", 2)
-            config["retry_interval"] = self.get_config("analysis.builtin.retry_interval", 5)
-            config["frame_prompt"] = self.get_config("analysis.builtin.frame_prompt", "")
-            
-            # 动态参数：只有用户配置了才传递
-            # 这些参数不同服务商可能不支持，所以不设默认值
-            optional_params = ["temperature", "max_tokens", "top_p", "top_k", "presence_penalty", "frequency_penalty"]
-            for param in optional_params:
-                value = self.get_config(f"analysis.builtin.{param}", None)
-                if value is not None:
-                    config[param] = value
-            
-            # 获取所有用户自定义的额外参数（服务商特有参数）
-            # 通过遍历配置获取所有analysis.builtin.*的配置项
-            builtin_config = self.get_config("analysis.builtin", {})
-            if isinstance(builtin_config, dict):
-                known_params = {
-                    "visual_max_duration_min", "frame_interval_sec", "lock_max_frames_5", "client_type",
-                    "base_url", "api_key", "model", "timeout", "max_retries",
-                    "retry_interval", "frame_prompt"
-                } | set(optional_params)
-                
-                for key, value in builtin_config.items():
-                    if key not in known_params and value is not None:
-                        # 用户自定义的额外参数，直接传递
-                        config[key] = value
-        else:
-            # 使用MaiBot VLM（default模式）或不使用VLM（doubao/none模式）
-            config["use_builtin"] = False
-            
-            # default模式：读取frame_prompt配置
-            if visual_method == "default":
-                config["frame_prompt"] = self.get_config("analysis.default.frame_prompt", "")
-        
-        return config
+        serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return hashlib.md5(serialized.encode("utf-8")).hexdigest()[:12]
+
+    def _get_visual_prompt(self) -> str:
+        return self.config.analysis.host.frame_prompt
+
+    async def _resolve_card_visual_texts(self, card_visual_hashes: list[str]) -> str:
+        normalized_hashes: list[str] = []
+        for card_hash in card_visual_hashes:
+            normalized = str(card_hash or "").strip()
+            if normalized and normalized not in normalized_hashes:
+                normalized_hashes.append(normalized)
+        if not normalized_hashes:
+            return ""
+
+        descriptions: list[str] = []
+        for card_hash in normalized_hashes:
+            description = await self._get_image_description_by_hash(card_hash)
+            if description and description not in descriptions:
+                descriptions.append(description)
+        return "\n".join(descriptions)
+
+    async def _get_image_description_by_hash(self, image_hash: str) -> str:
+        normalized_hash = str(image_hash or "").strip()
+        if not normalized_hash:
+            return ""
+
+        try:
+            record = await self.ctx.db.get(
+                model_name="Images",
+                filters={"image_hash": normalized_hash, "image_type": "image"},
+                limit=1,
+                single_result=True,
+            )
+        except Exception:
+            self.ctx.logger.debug("卡片预览图描述查询失败: image_hash=%s", normalized_hash, exc_info=True)
+            return ""
+
+        if not isinstance(record, dict):
+            return ""
+
+        description = str(record.get("description", "") or "").strip()
+        if not description:
+            self.ctx.logger.debug("卡片预览图描述未命中: image_hash=%s", normalized_hash)
+            return ""
+        self.ctx.logger.debug("卡片预览图描述命中: image_hash=%s, description_length=%s", normalized_hash, len(description))
+        return description
+
+    @staticmethod
+    def _looks_like_bili_command(*texts: str) -> bool:
+        for text in texts:
+            normalized = str(text or "").strip().lower()
+            if normalized.startswith("/bili"):
+                return True
+        return False
+
+    async def _refresh_host_task_snapshot(self) -> None:
+        if self._host_llm_adapter is None:
+            return
+        validation = await self._host_llm_adapter.validate_tasks(
+            visual_task_name=self.config.analysis.host.host_task_name,
+            summary_task_name=self.config.summary.host_task_name,
+        )
+        self._host_task_snapshot = validation.available_tasks
+        self.ctx.logger.info(
+            "宿主任务校验完成: visual=%s, summary=%s, tasks=%s",
+            validation.visual_task_ready,
+            validation.summary_task_ready,
+            ",".join(sorted(validation.available_tasks)) or "<empty>",
+        )
+        if not validation.visual_task_ready and self.config.analysis.visual_method == "host":
+            self.ctx.logger.warning(
+                "宿主未提供视觉任务 %s，host 模式后续将无法执行完整视觉分析",
+                self.config.analysis.host.host_task_name,
+            )
+        if self.config.summary.enabled and not validation.summary_task_ready:
+            self.ctx.logger.warning(
+                "宿主未提供总结任务 %s，总结阶段后续只能降级为原始信息",
+                self.config.summary.host_task_name,
+            )
+
+    def _allow_auto_detect_for_message(self, message_context) -> bool:
+        if message_context.is_group_message and not self.config.trigger.auto_detect_in_groups:
+            return False
+        if message_context.is_private_message and not self.config.trigger.auto_detect_in_private:
+            return False
+        return True
+
+    def _should_attempt_bilibili_detect(self, message_context) -> bool:
+        candidate_texts = (
+            message_context.processed_plain_text,
+            message_context.plain_text,
+            self._get_message_visible_text(message_context.raw_message),
+        )
+        for text in candidate_texts:
+            if self._contains_bilibili_text_marker(text):
+                return True
+            if self._contains_bilibili_id_pattern(text):
+                return True
+
+        for segment in message_context.raw_segments:
+            if self._segment_looks_like_bilibili_card(segment):
+                return True
+        return False
+
+    def _contains_bilibili_text_marker(self, text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return False
+        return any(marker.lower() in normalized for marker in self._BILIBILI_TEXT_MARKERS)
+
+    @staticmethod
+    def _contains_bilibili_id_pattern(text: str) -> bool:
+        normalized = str(text or "")
+        if not normalized:
+            return False
+        if "BV" in normalized or "bv" in normalized:
+            return True
+        lowered = normalized.lower()
+        if "av" in lowered:
+            return True
+        return False
+
+    def _segment_looks_like_bilibili_card(self, segment: dict[str, Any]) -> bool:
+        if not isinstance(segment, dict):
+            return False
+        segment_type = str(segment.get("type", "") or "").strip().lower()
+        if segment_type in {"json", "xml", "share"}:
+            return True
+
+        raw_data = segment.get("data")
+        if isinstance(raw_data, str):
+            if self._contains_bilibili_text_marker(raw_data) or self._contains_bilibili_id_pattern(raw_data):
+                return True
+        elif isinstance(raw_data, dict):
+            flattened = " ".join(str(value) for value in raw_data.values() if value is not None)
+            if self._contains_bilibili_text_marker(flattened) or self._contains_bilibili_id_pattern(flattened):
+                return True
+        return False
 
     async def _start_cleanup_task_after_delay(self):
-        """延迟启动定时清理任务
-        
-        在插件初始化完成后，延迟10秒再启动定时任务，确保插件完全初始化
-        后再开始定时任务，避免初始化过程中的竞争条件。
-        """
+        await self._cleanup_task_after_delay()
+
+    async def _cleanup_task_after_delay(self):
+        import asyncio
+
         await asyncio.sleep(10)
-        
-        # 获取临时文件最大保留时间配置
-        max_age_min = self.get_config("video.temp_file_max_age_min", 60)
-        
+        max_age_min = self.config.cache.temp_file_max_age_min
         if max_age_min > 0:
-            # 启动时执行一次清理
             cleanup_old_temp_files(max_age_min)
-            
-            # 启动定时清理任务
             self._cleanup_task = asyncio.create_task(self._periodic_cleanup_task(max_age_min))
-            
-            # 动态计算清理间隔：最小5分钟，最大30分钟
-            cleanup_interval_min = max(5, min(30, max_age_min))
-            logger.info(f"[BilibiliVideoParser] 定时清理任务已启动（间隔{cleanup_interval_min}分钟，保留{max_age_min}分钟内的临时文件）")
         else:
-            logger.info("[BilibiliVideoParser] 临时文件即时删除模式已启用")
-    
+            self._cleanup_task = None
+
     async def _periodic_cleanup_task(self, max_age_min: int):
-        """定时清理任务
-        
-        清理间隔动态调整：
-        - 最小5分钟，最大30分钟
-        - 默认等于 max_age_min
-        
-        Args:
-            max_age_min: 文件最大保留时间（分钟）
-        """
-        # 动态计算清理间隔：最小5分钟，最大30分钟
+        import asyncio
+
         cleanup_interval_min = max(5, min(30, max_age_min))
-        
         while True:
             try:
-                # 等待清理间隔
                 await asyncio.sleep(cleanup_interval_min * 60)
-                
-                # 执行清理（cleanup_old_temp_files内部会记录info日志）
                 cleanup_old_temp_files(max_age_min)
-                
             except asyncio.CancelledError:
-                logger.debug("[BilibiliVideoParser] 定时清理任务已取消")
                 break
-            except Exception as e:
-                logger.error(f"[BilibiliVideoParser] 定时清理任务异常: {e}")
-                # 继续运行，不因异常退出
+            except Exception:
+                continue
 
-    def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
-        """获取插件组件列表"""
-        components = []
-        
-        # 注册自动检测处理器
-        if self.get_config("trigger.auto_detect_enabled", True):
-            auto_detect_handler = BilibiliAutoDetectHandler
-            # 传递管理器实例
-            auto_detect_handler.cache_manager = self.cache_manager
-            auto_detect_handler.video_parser = self.video_parser
-            auto_detect_handler.video_analyzer = self.video_analyzer
-            components.append((
-                auto_detect_handler.get_handler_info(),
-                auto_detect_handler
-            ))
-        
-        # 注册命令处理器（BaseCommand，使用intercept_message_level=1让消息对replyer可见）
-        if self.get_config("trigger.command_enabled", True):
-            command_handler = BilibiliCommandHandler
-            # 传递管理器实例
-            command_handler.cache_manager = self.cache_manager
-            command_handler.video_parser = self.video_parser
-            command_handler.video_analyzer = self.video_analyzer
-            components.append((
-                command_handler.get_command_info(),  # BaseCommand使用get_command_info
-                command_handler
-            ))
-        
-        return components
+    @staticmethod
+    def _extract_command_text(message: Any) -> str:
+        if message is None:
+            return ""
+        if isinstance(message, dict):
+            return str(message.get("processed_plain_text", "") or message.get("plain_text", "") or "")
+        plain_text = message.plain_text
+        if isinstance(plain_text, str):
+            return plain_text
+        return str(message)
+
+    @staticmethod
+    def _get_message_plain_text(message: Any) -> str:
+        if isinstance(message, dict):
+            return str(message.get("plain_text", "") or "")
+        plain_text = message.plain_text
+        return plain_text if isinstance(plain_text, str) else ""
+
+    @staticmethod
+    def _get_message_processed_text(message: Any) -> str:
+        if isinstance(message, dict):
+            return str(message.get("processed_plain_text", "") or message.get("plain_text", "") or "")
+        processed_plain_text = message.processed_plain_text if hasattr(message, "processed_plain_text") else None
+        if isinstance(processed_plain_text, str):
+            return processed_plain_text
+        plain_text = message.plain_text
+        return plain_text if isinstance(plain_text, str) else ""
+
+    @staticmethod
+    def _get_message_visible_text(message: Any) -> str:
+        if isinstance(message, dict):
+            return str(message.get("processed_plain_text", "") or message.get("plain_text", "") or "")
+        processed_plain_text = message.processed_plain_text if hasattr(message, "processed_plain_text") else None
+        if isinstance(processed_plain_text, str) and processed_plain_text:
+            return processed_plain_text
+        plain_text = message.plain_text
+        return plain_text if isinstance(plain_text, str) else ""
+
+    @staticmethod
+    def _rewrite_message_text(message: Any, rewritten_text: str) -> None:
+        if isinstance(message, dict):
+            message["plain_text"] = rewritten_text
+            message["processed_plain_text"] = rewritten_text
+            return
+        message.plain_text = rewritten_text
+        if hasattr(message, "processed_plain_text"):
+            message.processed_plain_text = rewritten_text
+
+def create_plugin() -> BilibiliVideoParserMaisakaPlugin:
+    """创建插件实例。"""
+
+    return BilibiliVideoParserMaisakaPlugin()

@@ -1,537 +1,151 @@
-# -*- coding: utf-8 -*-
-"""
-视频解析模块 - 使用ffmpeg进行视频处理
+"""ffmpeg 视频处理。"""
 
-本模块封装了ffmpeg的视频处理功能，包括：
-1. 视频帧提取（按间隔抽帧、等距抽帧）
-2. 音频提取（用于ASR语音识别）
-3. 视频时长获取
+from __future__ import annotations
 
-主要类：
-- VideoParser: 视频解析器
-
-抽帧方式：
-1. 按间隔抽帧（extract_frames）：
-   - 每隔指定秒数抽取一帧
-   - 适合固定间隔的场景
-   
-2. 等距抽帧（extract_frames_equidistant）：
-   - 根据视频时长均匀分布抽帧点
-   - 公式：t_i = (i/(N+1))*duration
-   - 确保帧均匀分布在视频中
-
-图片格式处理：
-- 默认输出JPEG格式
-- 自动转换非JPEG格式（需要PIL）
-- 处理透明通道（RGBA -> RGB）
-
-临时文件管理：
-- 帧图片保存在 data/temp/frames/bili_frames_{uuid}/ 目录
-- 使用safe_delete模块的临时目录管理
-
-使用示例：
-    parser = VideoParser()
-    
-    # 检查ffmpeg
-    if parser.check_ffmpeg():
-        # 按间隔抽帧
-        frames = await parser.extract_frames(
-            video_path="/path/to/video.mp4",
-            interval_sec=6,
-            max_frames=10
-        )
-        
-        # 等距抽帧
-        frames = await parser.extract_frames_equidistant(
-            video_path="/path/to/video.mp4",
-            duration_sec=300,
-            count=10
-        )
-        
-        # 获取视频时长
-        duration = parser.get_video_duration("/path/to/video.mp4")
-
-依赖：
-- ffmpeg: 视频处理工具（必需）
-- ffprobe: 视频信息获取工具（可选，用于获取时长）
-- PIL: 图片处理（可选，用于格式转换）
-- safe_delete: 临时目录管理
-
-注意：
-- ffmpeg必须安装并在系统PATH中
-- 如果ffprobe不可用，get_video_duration将返回None
-
-Author: 约瑟夫.k && 白泽
-"""
+import asyncio
 import os
 import shutil
 import subprocess
-import asyncio
-from typing import Optional, Dict, Any, List
 from pathlib import Path
-from src.plugin_system import get_logger
-from .safe_delete import get_temp_subdir
+from typing import Any, Optional
 
-logger = get_logger("video_parser")
-
-# 尝试导入PIL用于图片格式转换
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-    logger.warning("[VideoParser] PIL未安装，图片格式转换功能将受限")
+from PIL import Image
 
 
 class VideoParser:
-    """视频解析器"""
-
-    def __init__(self, ffmpeg_path: Optional[str] = None, **kwargs):
-        """初始化视频解析器
-        
-        Args:
-            ffmpeg_path: ffmpeg可执行文件路径，为None时自动检测
-            **kwargs: 其他参数（保留兼容性）
-        """
+    def __init__(
+        self,
+        ffmpeg_path: Optional[str] = None,
+        *,
+        ffmpeg_probe_timeout_sec: int = 10,
+        ffmpeg_extract_audio_timeout_sec: int = 120,
+        ffmpeg_extract_frames_timeout_sec: int = 30,
+    ) -> None:
         self.ffmpeg_path = self._detect_ffmpeg(ffmpeg_path)
         self.ffprobe_path = self._detect_ffprobe(ffmpeg_path)
+        self._ffmpeg_probe_timeout_sec = max(1, int(ffmpeg_probe_timeout_sec))
+        self._ffmpeg_extract_audio_timeout_sec = max(1, int(ffmpeg_extract_audio_timeout_sec))
+        self._ffmpeg_extract_frames_timeout_sec = max(1, int(ffmpeg_extract_frames_timeout_sec))
 
-    def _resolve_binary_path(self, base_path: str, binary_name: str) -> Optional[str]:
-        """将目录或文件路径解析为具体可执行文件路径。"""
-        if not base_path:
-            return None
-
-        normalized = os.path.normpath(base_path.strip().strip('"'))
-        if not normalized:
-            return None
-
-        # 目录场景：兼容直接传 bin 目录
-        if os.path.isdir(normalized):
-            candidates = [
-                os.path.join(normalized, f"{binary_name}.exe"),
-                os.path.join(normalized, binary_name),
-            ]
-            for candidate in candidates:
+    def _detect_ffmpeg(self, custom_path: Optional[str] = None) -> Optional[str]:
+        if custom_path:
+            if os.path.isdir(custom_path):
+                candidate = os.path.join(custom_path, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
                 if os.path.isfile(candidate):
                     return candidate
-            return None
+            if os.path.isfile(custom_path):
+                return custom_path
+            found = shutil.which(custom_path)
+            if found:
+                return found
+        return shutil.which("ffmpeg")
 
-        target_names = {binary_name.lower(), f"{binary_name.lower()}.exe"}
-
-        # 文件场景：
-        # - ffmpeg_path 可传 ffmpeg(.exe)
-        # - 若传入的是另一个可执行文件（如 ffmpeg 用于查 ffprobe），
-        #   则尝试同目录定位目标可执行文件
-        if os.path.isfile(normalized):
-            file_name = os.path.basename(normalized).lower()
-            if file_name in target_names:
-                return normalized
-
-            parent_dir = os.path.dirname(normalized)
-            for name in (f"{binary_name}.exe", binary_name):
+    def _detect_ffprobe(self, custom_ffmpeg_path: Optional[str] = None) -> Optional[str]:
+        if custom_ffmpeg_path and os.path.isfile(custom_ffmpeg_path):
+            parent_dir = os.path.dirname(custom_ffmpeg_path)
+            for name in ("ffprobe.exe", "ffprobe"):
                 candidate = os.path.join(parent_dir, name)
                 if os.path.isfile(candidate):
                     return candidate
-            return None
-
-        # 兼容未写扩展名的输入，如 C:\ffmpeg\bin\ffmpeg
-        suffix_candidates = [f"{normalized}.exe", normalized]
-        for candidate in suffix_candidates:
-            if os.path.isfile(candidate):
-                file_name = os.path.basename(candidate).lower()
-                if file_name in target_names:
-                    return candidate
-
-        return None
-
-    def _detect_ffmpeg(self, custom_path: Optional[str] = None) -> Optional[str]:
-        """自动检测ffmpeg路径。
-
-        优先级：
-        1. 用户配置路径（支持目录或文件）
-        2. 系统 PATH
-        """
-        if custom_path:
-            resolved = self._resolve_binary_path(custom_path, "ffmpeg")
-            if resolved and os.path.isfile(resolved):
-                return resolved
-
-            which_result = shutil.which(custom_path)
-            if which_result:
-                return which_result
-
-            logger.warning(f"[VideoParser] 指定的ffmpeg路径无效: {custom_path}")
-
-        system_ffmpeg = shutil.which("ffmpeg")
-        if system_ffmpeg:
-            return system_ffmpeg
-
-        logger.error("[VideoParser] 未找到ffmpeg，请安装后重试")
-        return None
-
-    def _detect_ffprobe(self, custom_ffmpeg_path: Optional[str] = None) -> Optional[str]:
-        """自动检测ffprobe路径。"""
-        # 1. 优先尝试：如果用户配置了 ffmpeg 路径，尝试同目录解析 ffprobe
-        if custom_ffmpeg_path:
-            custom_ffprobe = self._resolve_binary_path(custom_ffmpeg_path, "ffprobe")
-            if custom_ffprobe:
-                return custom_ffprobe
-
-            # 用户传了 ffmpeg 文件路径时，再尝试同目录拼接 ffprobe
-            resolved_ffmpeg = self._resolve_binary_path(custom_ffmpeg_path, "ffmpeg")
-            if resolved_ffmpeg:
-                ffmpeg_dir = os.path.dirname(resolved_ffmpeg)
-                for name in ("ffprobe.exe", "ffprobe"):
-                    candidate = os.path.join(ffmpeg_dir, name)
-                    if os.path.isfile(candidate):
-                        return candidate
-
-        # 2. 尝试从系统PATH查找
-        system_ffprobe = shutil.which("ffprobe")
-        if system_ffprobe:
-            return system_ffprobe
-
-        # 3. 尝试从最终ffmpeg路径同目录查找
-        if self.ffmpeg_path:
-            ffmpeg_dir = os.path.dirname(self.ffmpeg_path)
-            for name in ("ffprobe.exe", "ffprobe"):
-                ffprobe_path = os.path.join(ffmpeg_dir, name)
-                if os.path.isfile(ffprobe_path):
-                    return ffprobe_path
-
-        return None
-
-    def check_ffmpeg(self) -> bool:
-        """检查ffmpeg是否可用"""
-        if not self.ffmpeg_path:
-            return False
-        try:
-            result = subprocess.run(
-                [self.ffmpeg_path, "-version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=5
-            )
-            return result.returncode == 0
-        except Exception as e:
-            logger.error(f"[VideoParser] ffmpeg检查失败: {e}")
-            return False
-
-    def _create_frames_temp_dir(self) -> str:
-        """创建帧临时目录
-        
-        Returns:
-            临时目录路径
-        """
-        import uuid
-        
-        # 使用插件的临时目录
-        frames_base_dir = get_temp_subdir("frames")
-        temp_dir_name = f"bili_frames_{uuid.uuid4().hex[:8]}"
-        temp_dir = os.path.join(frames_base_dir, temp_dir_name)
-        os.makedirs(temp_dir, exist_ok=True)
-        return temp_dir
-    
-    async def extract_frames(
-        self,
-        video_path: str,
-        interval_sec: int = 6,
-        max_frames: int = 10
-    ) -> List[str]:
-        """从视频中抽取关键帧（按间隔抽帧）
-        
-        Args:
-            video_path: 视频文件路径
-            interval_sec: 抽帧间隔(秒)
-            max_frames: 最大帧数
-            
-        Returns:
-            关键帧图片路径列表
-        """
-        frames = []
-        temp_dir = self._create_frames_temp_dir()
-        logger.debug(f"[VideoParser] 开始按间隔抽帧: video={video_path}, interval={interval_sec}s, max_frames={max_frames}")
-        
-        try:
-            # 使用ffmpeg抽帧
-            output_pattern = os.path.join(temp_dir, "frame_%03d.jpg")
-            cmd = [
-                self.ffmpeg_path,
-                "-i", video_path,
-                "-vf", f"fps=1/{interval_sec}",
-                "-frames:v", str(max_frames),
-                "-qscale:v", "2",
-                output_pattern
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            try:
-                _, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.communicate()
-                logger.error("[VideoParser] 抽帧失败: ffmpeg执行超时（300秒）")
-                return []
-
-            if process.returncode != 0:
-                err = (stderr or b"").decode(errors="ignore")
-                logger.error(f"[VideoParser] 抽帧失败: {err}")
-                return []
-            
-            # 收集生成的帧
-            for i in range(1, max_frames + 1):
-                frame_path = os.path.join(temp_dir, f"frame_{i:03d}.jpg")
-                if os.path.exists(frame_path):
-                    frames.append(frame_path)
-            
-            logger.debug(f"[VideoParser] 按间隔抽帧完成: 共抽取 {len(frames)} 帧")
-            return frames
-            
-        except Exception as e:
-            logger.error(f"[VideoParser] 抽帧异常: {e}")
-            return []
-    
-    async def extract_frames_equidistant(
-        self,
-        video_path: str,
-        duration_sec: float,
-        count: int = 10,
-        output_format: str = "jpeg"
-    ) -> List[str]:
-        """从视频中等距抽取关键帧
-        
-        Args:
-            video_path: 视频文件路径
-            duration_sec: 视频时长(秒)
-            count: 抽取帧数
-            output_format: 输出图片格式，默认为jpeg
-            
-        Returns:
-            关键帧图片路径列表
-        """
-        frames = []
-        temp_dir = self._create_frames_temp_dir()
-        logger.debug(f"[VideoParser] 开始等距抽帧: video={video_path}, duration={duration_sec}s, count={count}")
-        
-        try:
-            N = max(1, int(count))
-            total = max(0.0, float(duration_sec))
-            
-            # 计算等距时间点：t_i = (i/(N+1))*duration
-            times = []
-            for i in range(1, N + 1):
-                t = (i / (N + 1.0)) * total
-                times.append(t)
-            
-            # 为每个时间点抽取一帧
-            for idx, t in enumerate(times, start=1):
-                frame_path = os.path.join(temp_dir, f"frame_{idx:03d}.jpg")
-                cmd = [
-                    self.ffmpeg_path,
-                    "-y",
-                    "-ss", f"{max(0.0, t):.3f}",
-                    "-i", video_path,
-                    "-frames:v", "1",
-                    "-qscale:v", "2",
-                    "-f", "image2",  # 强制输出为图片格式
-                    "-c:v", "mjpeg",  # 使用MJPEG编码器确保输出JPEG
-                    frame_path
-                ]
-                
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-
-                try:
-                    _, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.communicate()
-                    logger.warning(f"[VideoParser] 在 {t:.3f}s 处抽帧超时")
-                    continue
-
-                if process.returncode == 0 and os.path.exists(frame_path):
-                    # 验证并确保是JPEG格式
-                    converted_path = self._ensure_jpeg_format(frame_path)
-                    if converted_path:
-                        frames.append(converted_path)
-                    else:
-                        frames.append(frame_path)
-                else:
-                    err = (stderr or b"").decode(errors="ignore")
-                    logger.warning(f"[VideoParser] 在 {t:.3f}s 处抽帧失败: {err[:120]}")
-            
-            logger.debug(f"[VideoParser] 等距抽帧完成: 共抽取 {len(frames)} 帧")
-            return frames
-            
-        except Exception as e:
-            logger.error(f"[VideoParser] 等距抽帧异常: {e}")
-            return []
-    
-    def _ensure_jpeg_format(self, image_path: str) -> Optional[str]:
-        """确保图片是JPEG格式
-        
-        Args:
-            image_path: 图片路径
-            
-        Returns:
-            转换后的图片路径，如果转换失败返回None
-        """
-        if not PIL_AVAILABLE:
-            # PIL不可用，假设ffmpeg已正确输出JPEG
-            return image_path
-        
-        try:
-            with Image.open(image_path) as img:
-                # 检查是否已经是JPEG格式
-                if img.format == 'JPEG':
-                    return image_path
-                
-                # 转换为JPEG格式
-                # 如果有透明通道，需要先转换为RGB
-                if img.mode in ('RGBA', 'LA', 'P'):
-                    # 创建白色背景
-                    background = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'P':
-                        img = img.convert('RGBA')
-                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-                    img = background
-                elif img.mode != 'RGB':
-                    img = img.convert('RGB')
-                
-                # 保存为JPEG
-                jpeg_path = image_path.rsplit('.', 1)[0] + '.jpg'
-                img.save(jpeg_path, 'JPEG', quality=85)
-                
-                # 如果原文件不是JPEG，删除原文件
-                if jpeg_path != image_path and os.path.exists(image_path):
-                    os.remove(image_path)
-                
-                return jpeg_path
-                
-        except Exception as e:
-            logger.warning(f"[VideoParser] 图片格式转换失败: {e}")
-            return image_path
-
-    async def extract_audio_text(self, video_path: str) -> Optional[str]:
-        """从视频中提取音频并转文字
-        
-        注意：此方法已废弃，ASR功能已移至 services/video_service.py 中实现。
-        请使用 VideoService._extract_audio_text() 方法。
-        
-        ASR实现位置：
-        - 音频提取：VideoService._extract_audio() (video_service.py:553)
-        - 语音识别：VideoService._call_voice_model() (video_service.py:601)
-        
-        保留此方法是为了向后兼容，但始终返回None。
-        
-        Args:
-            video_path: 视频文件路径
-            
-        Returns:
-            始终返回None（请使用VideoService中的ASR功能）
-        """
-        # ASR功能已移至 services/video_service.py 中实现
-        # 请参考 VideoService._extract_audio_text() 方法
-        return None
+        return shutil.which("ffprobe")
 
     def get_video_duration(self, video_path: str) -> Optional[float]:
-        """获取视频时长
-        
-        Args:
-            video_path: 视频文件路径
-            
-        Returns:
-            时长(秒)
-        """
         if not self.ffprobe_path:
-            logger.warning("[VideoParser] ffprobe不可用，无法获取视频时长")
             return None
-        
         try:
-            cmd = [
+            result = subprocess.run([
                 self.ffprobe_path,
                 "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
-                video_path
-            ]
-            
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=10
-            )
-            
+                video_path,
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=self._ffmpeg_probe_timeout_sec)
             if result.returncode == 0:
-                duration = float(result.stdout.decode().strip())
-                return duration
-            
-        except Exception as e:
-            logger.error(f"[VideoParser] 获取视频时长失败: {e}")
-        
+                return float(result.stdout.decode().strip())
+        except Exception:
+            return None
         return None
 
-    async def parse_video(
-        self,
-        video_path: str,
-        frame_interval: int = 6,
-        max_frames: int = 10,
-        enable_asr: bool = False
-    ) -> Dict[str, Any]:
-        """解析视频内容
-        
-        Args:
-            video_path: 视频路径
-            frame_interval: 抽帧间隔
-            max_frames: 最大帧数
-            enable_asr: 是否启用ASR
-            
-        Returns:
-            解析结果字典
-        """
-        result = {
-            "frames": [],
-            "audio_text": None,
-            "duration": None,
-            "error": None
-        }
-        
-        logger.debug(f"[VideoParser] 开始解析视频: {video_path}")
-        
+    def _create_frames_temp_dir(self) -> str:
+        temp_dir = Path(__file__).resolve().parent.parent / "data" / "temp" / "frames" / f"bili_frames_{os.urandom(4).hex()}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        return str(temp_dir)
+
+    def _ensure_jpeg_format(self, image_path: str) -> str:
         try:
-            # 获取视频时长
-            duration = self.get_video_duration(video_path)
-            result["duration"] = duration
-            logger.debug(f"[VideoParser] 视频时长: {duration}s")
-            
-            # 抽取关键帧
-            frames = await self.extract_frames(
-                video_path,
-                interval_sec=frame_interval,
-                max_frames=max_frames
-            )
-            result["frames"] = frames
-            
-            logger.debug(f"[VideoParser] 抽帧完成: {len(frames)} 帧")
-            
-            # 提取音频文本(如果启用)
-            if enable_asr:
-                logger.debug("[VideoParser] 开始ASR音频识别...")
-                audio_text = await self.extract_audio_text(video_path)
-                result["audio_text"] = audio_text
-                logger.debug(f"[VideoParser] ASR完成: {len(audio_text) if audio_text else 0} 字符")
-            
-        except Exception as e:
-            logger.error(f"[VideoParser] 视频解析失败: {e}")
-            result["error"] = str(e)
-        
-        return result
+            with Image.open(image_path) as img:
+                if img.format == "JPEG":
+                    return image_path
+                if img.mode in ("RGBA", "LA", "P"):
+                    background = Image.new("RGB", img.size, (255, 255, 255))
+                    if img.mode == "P":
+                        img = img.convert("RGBA")
+                    background.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+                    img = background
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+                jpeg_path = image_path.rsplit(".", 1)[0] + ".jpg"
+                img.save(jpeg_path, "JPEG", quality=85)
+                if jpeg_path != image_path and os.path.exists(image_path):
+                    os.remove(image_path)
+                return jpeg_path
+        except Exception:
+            return image_path
+
+    async def extract_frames(self, video_path: str, interval_sec: int = 6, max_frames: int = 10) -> list[str]:
+        frames: list[str] = []
+        temp_dir = self._create_frames_temp_dir()
+        output_pattern = os.path.join(temp_dir, "frame_%03d.jpg")
+        cmd = [self.ffmpeg_path, "-i", video_path, "-vf", f"fps=1/{interval_sec}", "-frames:v", str(max_frames), "-qscale:v", "2", output_pattern]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=self._ffmpeg_extract_frames_timeout_sec)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return []
+        if process.returncode != 0:
+            return []
+        for i in range(1, max_frames + 1):
+            frame_path = os.path.join(temp_dir, f"frame_{i:03d}.jpg")
+            if os.path.exists(frame_path):
+                frames.append(self._ensure_jpeg_format(frame_path))
+        return frames
+
+    async def extract_frames_equidistant(self, video_path: str, duration_sec: float, count: int = 10, output_format: str = "jpeg") -> list[str]:
+        del output_format
+        frames: list[str] = []
+        temp_dir = self._create_frames_temp_dir()
+        total = max(0.0, float(duration_sec))
+        times = [(i / (count + 1.0)) * total for i in range(1, max(1, int(count)) + 1)]
+        for idx, t in enumerate(times, start=1):
+            frame_path = os.path.join(temp_dir, f"frame_{idx:03d}.jpg")
+            cmd = [self.ffmpeg_path, "-y", "-ss", f"{max(0.0, t):.3f}", "-i", video_path, "-frames:v", "1", "-qscale:v", "2", "-f", "image2", "-c:v", "mjpeg", frame_path]
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                await asyncio.wait_for(process.communicate(), timeout=self._ffmpeg_extract_frames_timeout_sec)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                continue
+            if process.returncode == 0 and os.path.exists(frame_path):
+                frames.append(self._ensure_jpeg_format(frame_path))
+        return frames
+
+    async def extract_audio(self, video_path: str) -> Optional[str]:
+        if not self.ffmpeg_path:
+            return None
+        audio_dir = Path(__file__).resolve().parent.parent / "data" / "temp" / "audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = audio_dir / f"bili_audio_{os.urandom(4).hex()}.wav"
+        cmd = [self.ffmpeg_path, "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", str(audio_path)]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=self._ffmpeg_extract_audio_timeout_sec)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return None
+        if process.returncode != 0 or not audio_path.exists():
+            return None
+        return str(audio_path)

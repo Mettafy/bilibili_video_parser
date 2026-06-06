@@ -1,425 +1,188 @@
-# B站视频解析插件
+# B站视频解析插件 Maisaka 版
 
-适用于 MaiBot 的 B站视频内容解析插件。
+适用于 Maisaka 新插件系统的 B站视频内容解析插件。
 
----
+当前版本的正式能力边界如下：
 
-## ⚠️ 免责声明
+1. 视觉分析只支持 Maisaka 宿主视觉任务和 `none` 模式。
+2. 总结生成只支持 Maisaka 宿主模型任务。
+3. ASR 仍然使用插件独立配置的 OpenAI 兼容音频转写接口。
+4. 宿主模型调用超时通过独立的 `[host_timeout]` 配置块控制，单位为分钟。
+5. 自动检测链与 `/bili` 命令链的总预算统一通过 `[trigger_timeout]` 配置块控制。
 
-**本插件使用 Claude 4.5 全面编写。**
+## 注意事项
 
-使用本插件即表示您同意以下条款：
-
-1. 本插件按"原样"提供，不提供任何形式的明示或暗示担保
-2. 作者不对因使用本插件而导致的任何直接、间接、偶然、特殊或后果性损害承担责任
-3. 本插件仅供学习和研究目的，请遵守相关法律法规和B站用户协议
-4. 用户应自行承担使用本插件的全部风险
-
----
-
-## ⚠️ 注意事项
-
-在使用本插件前，请**务必注意**以下几点：
-
-0.  配置文件有多久清理临时视频文件选项，但是请设置的长一点，然后**手动清理插件目录下的 `data/temp`**，或者你可以相信ai写出来的代码。
-
-1. **必须安装插件依赖**：本插件需要额外的 Python 依赖包，请参考下方"安装插件"章节。
-2. **ASR功能配置**：如需使用 ASR 功能（语音转文字），必须在 MaiBot 配置文件 `model_config.toml` 中配置 `[model_task_config.voice]` 语音识别模型，否则 ASR 功能无法正常运行。
-3. **FFmpeg 功能说明**：FFmpeg 是本插件的核心依赖，负责以下功能：
-   - 视频下载后的格式处理
-   - 视频抽帧（提取关键帧用于视觉分析）
-   - 音频分离（用于 ASR 语音识别）
-4. **SESSDATA** ：使用此功能获取视频字幕，可能会导致账号被**b站风控**，请使用小号。
-
----
+1. 必须安装插件依赖。
+2. 如需使用 ASR，必须在插件配置中填写可用的插件独立 OpenAI 兼容语音转写接口。
+3. ffmpeg / ffprobe 是本插件的核心依赖，用于：
+   - 视频抽帧
+   - 音频提取
+   - 视频时长探测
+4. 使用 `SESSDATA` 获取字幕可能导致 B站风控，请使用小号。
 
 ## 安装前准备
 
 ### 安装 ffmpeg
 
-本插件依赖 `ffmpeg` / `ffprobe`。默认从系统 `PATH` 检测，也支持在插件配置中指定路径。
+本插件依赖 `ffmpeg` / `ffprobe`。
 
-- **Windows**
-  - 推荐方式A：把 ffmpeg 的 `bin` 目录加入系统 `PATH`
-  - 推荐方式B：在插件配置 `[video].ffmpeg_path` 中填写：
-    - `bin` 目录路径（示例：`C:\\tools\\ffmpeg\\bin`）
-    - 或 `ffmpeg.exe` 完整路径（示例：`C:\\tools\\ffmpeg\\bin\\ffmpeg.exe`）
-- **Linux**
-  - 通过包管理器安装，通常无需单独配置路径：
-    - Debian/Ubuntu：`sudo apt update && sudo apt install -y ffmpeg`
-    - CentOS/RHEL/Fedora：`sudo yum install -y ffmpeg` 或 `sudo dnf install -y ffmpeg`
-- **容器环境（Docker）**
-  - 与 Linux 一致：进入容器内部通过命令手动安装 ffmpeg
-
----
+- Windows
+  - 推荐把 ffmpeg 的 `bin` 目录加入系统 `PATH`
+  - 也可以在插件配置 `[video].ffmpeg_path` 中填写：
+    - `bin` 目录路径
+    - 或 `ffmpeg.exe` 完整路径
+- Linux
+  - Debian / Ubuntu：`sudo apt install -y ffmpeg`
+  - Fedora / RHEL：`sudo dnf install -y ffmpeg`
 
 ## 安装插件
 
-1. 将整个 `bilibili_video_parser` 目录复制到 MaiBot 的 `plugins` 目录下
+1. 将 `plugins/bilibili_video_parser_maisaka` 放入 Maisaka 的 `plugins/` 目录。
+2. 安装依赖：
 
-2. **安装插件依赖**（必须在 MaiBot 的虚拟环境中执行）：
+```bash
+pip install -r plugins/bilibili_video_parser_maisaka/requirements.txt
+```
 
-   ```bash
-   #### 首先进入 MaiBot 的虚拟环境
-
-   # Windows:
-   cd MaiBot目录
-   .venv\Scripts\activate
-   
-   # Linux/macOS:
-   cd MaiBot目录
-   source .venv/bin/activate
-   
-   # 然后安装插件依赖
-   pip install -r plugins/bilibili_video_parser/requirements.txt
-
-   # 一键包，双击打开[点我启动.bat]控制台，使用 交互式安装依赖 选项即可。
-   ```
-
-3. 确保系统已安装 ffmpeg
-
-4. 重启 MaiBot 或在 WebUI 中重新加载插件，使插件自动生成配置文件
-
-5. 修改完插件配置文件请再次重启maibot。
-
----
+3. 检查插件目录下的 `config.toml`。
+4. 重启 Maisaka 或重新加载插件。
 
 ## 使用方法
 
-> ✅ 支持 B站视频链接、BV/AV 号，以及 QQ 中分享的 B站小程序卡片（需适配器为最新版本）。
-
-
 ### 自动检测模式
 
-直接发送 B站视频链接、AV号或BV号，麦麦会自动识别并解析：
+直接发送：
 
-```
+```text
 https://www.bilibili.com/video/BV1xx411c7XZ
 https://b23.tv/xxxxxx
 av12345678
 BV1xx411c7XZ
 ```
 
+插件会解析视频，并把处理后的文本写回消息上下文，再交给 Maisaka 主回复系统继续回复。
+自动检测链会先准备视频基础信息，再在剩余预算内尝试字幕、视觉、ASR 与总结。
+当自动检测总超时发生时，只要已经拿到标题、作者、简介、时长等 metadata，就会优先用基础信息重写用户消息，而不是退回纯视频 ID 文本。
+
 ### 命令模式
 
-使用 `/bili` 命令主动触发解析：
-
-```
+```text
 /bili https://www.bilibili.com/video/BV1xx411c7XZ
 /bili av12345678
 /bili BV1xx411c7XZ
 ```
 
----
+命令模式会直接返回工具型结果文本，不再在插件内部模拟 bot 人设进行聊天式回复。
+`[command]` 配置块只控制这条工具型命令链的提示与参数行为，不再承担旧回复模式开关。
+命令链的真实总预算由 `[trigger_timeout].command_total_timeout_sec` 控制；组件外层 RPC 超时通过 `@Command(..., timeout_ms=...)` 静态声明为更高上限，避免默认 60000ms 先切断命令桥。
 
-## 配置文件说明
+## 视觉模式
 
-配置文件位于插件目录下的 `config.toml`，首次启动会自动生成。
-
-### [plugin] 插件基本信息
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `config_version` | string | `"3.2.0"` | 配置文件版本号，请勿手动修改 |
-| `enabled` | bool | `true` | 是否启用插件 |
-
-### [trigger] 触发方式配置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `auto_detect_enabled` | bool | `true` | 是否自动检测B站链接。开启后，用户发送B站链接时会自动触发解析 |
-| `command_enabled` | bool | `true` | 是否启用 `/bili` 命令触发 |
-
-### [summary] 总结生成配置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enable_summary` | bool | `true` | 是否生成最终总结。开启时会调用模型生成总结；关闭时直接将原生视频信息发送给回复系统 |
-| `summary_max_chars` | int | `200` | 总结最大字数。范围：60-2000，**建议保持默认值** |
-
-> ⚠️ **关于 summary_max_chars 的说明**：
->
-> 建议保持默认值 200，原因如下：
-> 1. **消息长度限制**：MaiBot 对消息长度有截断限制，总结过长会导致视频信息被截断，影响回复质量
-> 2. **上下文效率**：过长的总结会占用更多的上下文空间，可能影响 MaiBot 的回复生成
-> 3. **阅读体验**：200字左右的总结既能涵盖视频核心内容，又不会让用户感到信息过载
->
-> 如果确实需要更长的总结，请确保您了解可能带来的影响。
-
-### [video] 视频处理配置
-
-用于从B站获取视频原生信息（视频信息、字幕、下载视频等）的配置。
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `max_duration_min` | float | `60.0` | 视频最大时长（分钟）。超过此时长的视频将被跳过不处理 |
-| `max_size_mb` | int | `300` | 视频最大文件大小（MB）。超过此大小的视频将被跳过 |
-| `sessdata` | string | `""` | B站SESSDATA Cookie。用于获取视频字幕，不填写时将跳过字幕获取。<br />**使用此功能可能会导致账号被b站风控，请使用小号。** |
-| `ffmpeg_path` | string | `""` | ffmpeg路径（可选）。Windows可填写 ffmpeg 的 `bin` 目录或 `ffmpeg(.exe)` 完整路径；Linux/容器通常留空并使用系统 PATH |
-| `enable_asr` | bool | `false` | 是否启用ASR语音识别。开启后会从视频音轨中提取语音进行识别，作为字幕的补充 |
-| `cache_enabled` | bool | `true` | 是否启用视频解析结果缓存。开启后，相同视频不会重复解析 |
-| `temp_file_max_age_min` | int | `60` | 临时文件最大保留时间（分钟）。设为0表示处理完成后立即删除 |
-| `download_timeout_sec` | int | `300` | 视频下载超时时间（秒）。用于从B站下载视频文件，超时后降级到字幕模式或基础信息模式 |
-| `retry_max_attempts` | int | `3` | B站API请求最大重试次数。用于获取视频信息、字幕、下载地址等B站接口调用 |
-| `retry_interval_sec` | float | `2.0` | B站API请求重试间隔（秒） |
-
-> 💡 **降级机制说明**：
->
-> 当视频下载失败或超时时，插件会自动降级处理：
-> - **Level 1（完整模式）**：视频下载成功 → 视觉分析 + 字幕 → 调用LLM生成总结
-> - **Level 2（字幕模式）**：视频下载失败，但有字幕 → 仅使用字幕 → 调用LLM生成总结
-> - **Level 3（基础信息模式）**：视频下载失败，且无字幕 → 不调用LLM，直接发送视频基础信息（标题、UP主、时长、简介）给主回复系统
-
-**如何获取 SESSDATA：**使用此功能获取视频字幕，可能会导致账号被b站风控，请使用小号。
-
-1. 登录 B站网页版
-2. 按 F12 打开开发者工具
-3. 切换到"应用程序"（Application）标签
-4. 在左侧找到 Cookies → bilibili.com
-5. 找到名为 `SESSDATA` 的 Cookie，复制其值
-![alt text](image.png)
-
-**Windows 的 `ffmpeg_path` 填写示例：**
-
-```toml
-[video]
-# 方式1：填 bin 目录
-ffmpeg_path = "C:\\tools\\ffmpeg\\bin"
-
-# 方式2：填 ffmpeg.exe 完整路径
-# ffmpeg_path = "C:\\tools\\ffmpeg\\bin\\ffmpeg.exe"
-```
-
-> Linux 与容器环境通常不需要填写 `ffmpeg_path`，保持为空即可。
-
-### [analysis] 视觉分析配置
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `visual_method` | string | `"default"` | 视觉分析方式，可选值见下表 |
-
-**visual_method 可选值：**
-
-| 值 | 说明 |
-|----|------|
-| `default` | 使用 MaiBot 主程序配置的 VLM 模型进行帧分析（推荐） |
-| `builtin` | 使用插件内置的 VLM 配置，需要在 `[analysis.builtin]` 中配置 API |
-| `doubao` | 使用豆包视频理解模型，需要在 `[analysis.doubao]` 中配置 API |
-| `none` | 不进行视觉分析，仅使用字幕和视频信息 |
-
-### [analysis.default] Default模式配置
-
-使用 MaiBot 主程序的 VLM 模型时的配置。
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟）。超过此时长的视频将只使用字幕+ASR，不进行视觉分析（节省API费用） |
-| `lock_max_frames_5` | bool | `true` | 是否锁定为固定等距抽5帧。`true`：固定等距抽5帧（最多5帧）；`false`：按视频时长和 `frame_interval_sec` 动态计算等距抽帧；若时长未知则降级到固定5帧逻辑 |
-| `frame_interval_sec` | int | `10` | 抽帧间隔（秒）。仅在 `lock_max_frames_5=false` 时生效，用于按视频时长动态计算等距抽帧数量 |
-| `frame_prompt` | string | `""` | 自定义帧分析提示词，留空使用默认提示词 |
-| `parallel_frame_analysis` | bool | `false` | 是否启用并发关键帧识别。`false` 时严格逐帧串行；`true` 时启用并发（并发数由 `parallel_frame_analysis_limit` 控制） |
-| `parallel_frame_analysis_limit` | int | `2` | 并发关键帧识别的最大并发数。**仅在 `parallel_frame_analysis=true` 时生效**。建议范围 1-5，值越大越快但更容易触发模型/服务限流 |
-
-> ⚠️ **关于 frame_prompt 的说明**：
->
-> - **默认提示词**：要求VLM返回少于25字的简短描述
-> - **自定义提示词**：您可以在提示词中指定返回字数，如"请用100字描述..."
-> - **约束自动追加**：无论是否使用自定义提示词，系统都会在末尾自动追加约束："仅描述画面中实际出现的内容，不要推测或编造。若无法判断，请回答'未识别'。"
-> - **建议**：不建议设置过长的帧描述，因为每帧描述都会占用上下文空间，影响最终总结质量
-
-### [analysis.builtin] Builtin模式配置
-
-使用插件内置 VLM 时的配置。需要自行配置 API。支持动态参数传递，可根据不同API服务商添加自定义参数。
-
-> 💡 **注意**：此节的超时和重试配置用于 VLM API 请求（帧图片分析），与 `[video]` 节的 B站API 配置是独立的。
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟） |
-| `lock_max_frames_5` | bool | `true` | 是否锁定为固定等距抽5帧。`true`：固定等距抽5帧（最多5帧）；`false`：按视频时长和 `frame_interval_sec` 动态计算等距抽帧；若时长未知则降级到固定5帧逻辑 |
-| `frame_interval_sec` | int | `10` | 抽帧间隔（秒）。仅在 `lock_max_frames_5=false` 时生效，用于按视频时长动态计算等距抽帧数量 |
-| `client_type` | string | `"openai"` | API服务类型：`openai`（兼容OpenAI格式的API）或 `gemini`（Google Gemini格式） |
-| `base_url` | string | `"https://api.siliconflow.cn/v1"` | API基础URL |
-| `api_key` | string | `""` | API密钥 |
-| `model` | string | `"Qwen/Qwen2.5-VL-72B-Instruct"` | 模型标识符（API服务商提供的模型ID） |
-| `timeout` | int | `60` | VLM API请求超时时间（秒）。用于帧图片分析请求 |
-| `max_retries` | int | `2` | VLM API请求最大重试次数。用于帧图片分析失败后的重试 |
-| `retry_interval` | int | `5` | VLM API请求重试间隔（秒） |
-| `frame_prompt` | string | `""` | 自定义帧分析提示词，留空使用默认提示词 |
-| `parallel_frame_analysis` | bool | `false` | 是否启用并发关键帧识别。`false` 时严格逐帧串行；`true` 时启用并发（并发数由 `parallel_frame_analysis_limit` 控制） |
-| `parallel_frame_analysis_limit` | int | `2` | 并发关键帧识别的最大并发数。**仅在 `parallel_frame_analysis=true` 时生效**。建议范围 1-5，值越大越快但更容易触发模型/服务限流 |
-
-**动态参数说明**：builtin模式支持动态参数传递，您可以根据API服务商的要求添加额外参数，如 `temperature`、`max_tokens`、`top_p` 等。只有您在配置文件中实际定义的参数才会被传递给API。
-
-> ⚠️ **关于 frame_prompt 的说明**：
->
-> - **默认提示词**：要求VLM返回少于25字的简短描述
-> - **自定义提示词**：您可以在提示词中指定返回字数，如"请用100字描述..."
-> - **约束自动追加**：无论是否使用自定义提示词，系统都会在末尾自动追加约束："仅描述画面中实际出现的内容，不要推测或编造。若无法判断，请回答'未识别'。"
-> - **建议**：不建议设置过长的帧描述，因为每帧描述都会占用上下文空间，影响最终总结质量
+当前只支持两种视觉模式：
 
-### [analysis.doubao] Doubao模式配置
+1. `host`：使用 Maisaka 宿主已配置的视觉任务分析关键帧。
+2. `none`：完全跳过视觉分析，只使用字幕、插件独立 ASR、卡片文字和基础信息。
 
-使用豆包视频理解模型时的配置。支持动态参数传递。
+不再支持插件内置 VLM，也不再支持豆包视频理解。
 
-> 💡 **注意**：此节的超时和重试配置用于豆包 API 请求（视频上传和分析），与 `[video]` 节的 B站API 配置是独立的。豆包需要上传视频并等待分析结果，建议设置较长的超时时间。
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `visual_max_duration_min` | float | `10.0` | 进行视觉分析的最大视频时长（分钟） |
-| `api_key` | string | `""` | 豆包API密钥，也可通过环境变量 `ARK_API_KEY` 设置 |
-| `model_id` | string | `"doubao-seed-1-6-flash-250828"` | 豆包模型ID |
-| `fps` | float | `1.0` | 抽帧频率（0.2-5），值越高理解越精细但token消耗越大 |
-| `base_url` | string | `"https://ark.cn-beijing.volces.com/api/v3"` | 豆包API基础URL |
-| `timeout` | int | `120` | 豆包API请求超时时间（秒）。包含视频上传和分析返回的总时间，建议设置较长 |
-| `max_retries` | int | `2` | 豆包API请求最大重试次数。用于视频分析失败后的重试 |
-| `retry_interval` | int | `10` | 豆包API请求重试间隔（秒）。豆包服务可能需要较长恢复时间，建议设置较长 |
-| `summary_min_chars` | int | `100` | 豆包视频分析最小字数 |
-| `summary_max_chars` | int | `150` | 豆包视频分析最大字数 |
-| `video_prompt` | string | `""` | 自定义视频分析提示词，留空使用默认提示词。提示词中可使用 `{summary_min_chars}` 和 `{summary_max_chars}` 占位符 |
-
-**动态参数说明**：doubao模式同样支持动态参数传递，您可以添加豆包API支持的额外参数。
-
----
+## 宿主超时覆盖
 
-## 配置示例
+`[host_timeout]` 配置块用于覆盖插件调用 Maisaka 宿主 LLM 能力时的单次请求超时。
 
-### 最简配置（使用MaiBot的VLM）
+它只控制宿主 LLM 单次请求，不控制自动检测链或 `/bili` 命令链的整条入口总预算。
 
-```toml
-[plugin]
-enabled = true
+关键规则：
 
-[trigger]
-auto_detect_enabled = true
-command_enabled = true
+1. 用户填写单位固定为分钟。
+2. 默认值为 `5.0` 分钟。
+3. 可以填写小数，例如 `1.2`、`5.2`。
+4. 插件内部会向上取整转换为毫秒后注入宿主 LLM 调用。
+5. 当前版本中，宿主任务发现与宿主模型请求共享同一套预算策略。
+6. 当 `[host_timeout].enabled = false` 时，宿主 LLM 调用都会退回 Runner 默认 RPC 超时。
 
-[summary]
-enable_summary = true
-summary_max_chars = 200
+示例：
 
-[video]
-sessdata = "你的SESSDATA"
+1. `1.2` 分钟会转换为 `72000ms`
+2. `5.2` 分钟会转换为 `312000ms`
 
-[analysis]
-visual_method = "default"
-```
+## 降级机制
 
-### 使用插件内置VLM（硅基流动）
+### Level 1：完整模式
 
-```toml
-[plugin]
-enabled = true
+- 下载成功
+- 宿主视觉分析成功或部分成功
+- 字幕 / ASR 可用
+- 总结成功
 
-[summary]
-enable_summary = true
-summary_max_chars = 200
+输出：
 
-[video]
-sessdata = "你的SESSDATA"
+1. 自动检测链：总结结果被写回增强后的用户消息
+2. 指令链：直接返回基础信息 + 总结结果
 
-[analysis]
-visual_method = "builtin"
+### Level 2：字幕模式
 
-[analysis.builtin]
-client_type = "openai"
-base_url = "https://api.siliconflow.cn/v1"
-api_key = "你的API密钥"
-model = "Qwen/Qwen2.5-VL-72B-Instruct"
-```
+- 宿主视觉分析失败或被跳过
+- 但字幕 / ASR 仍然可用
 
-### 使用豆包视频模型
+输出：
 
-```toml
-[plugin]
-enabled = true
+1. 自动检测链：回退到 raw_info 或 metadata 级增强文本
+2. 指令链：返回原始信息，并附加总结失败说明
 
-[summary]
-enable_summary = true
-summary_max_chars = 200
+### Level 3：基础信息模式
 
-[video]
-sessdata = "你的SESSDATA"
+- 无视觉分析
+- 无字幕 / ASR
 
-[analysis]
-visual_method = "doubao"
+输出：基础信息文本；在自动检测链中作为 metadata 级回退，在指令链中附加总结失败说明。
 
-[analysis.doubao]
-api_key = "你的豆包API密钥"
-model_id = "doubao-seed-1-6-flash-250828"
-```
+### 自动检测总超时
 
----
+自动检测总超时遵循以下规则：
 
-## 故障排查
+1. 先保住 metadata 级结果。
+2. 内容升级阶段超时时，优先回退为基础信息重写文本。
+3. `[trigger_timeout].auto_detect_total_timeout_sec` 是严格总预算，超时后不会再额外发起恢复请求。
+4. 只有 metadata 阶段本身未完成时，才会退回最小短文本。
 
-### ffmpeg 未找到
+### 命令链总超时
 
-**症状**：插件加载时提示 "ffmpeg不可用，视频解析功能将受限"
+`/bili` 命令链和自然语言自动检测链属于同一类“入口链预算”。
 
-**解决方法**：
-1. 在终端运行 `ffmpeg -version` 与 `ffprobe -version` 确认安装成功
-2. 如果命令不存在，请先安装 ffmpeg：
-   - Linux：`apt/yum/dnf` 安装
-   - 容器：在镜像内安装并确保 `PATH` 可见
-3. Windows 用户可二选一：
-   - 将 ffmpeg 的 `bin` 目录加入 `PATH`
-   - 在插件配置 `[video].ffmpeg_path` 中填写 `bin` 目录或 `ffmpeg.exe` 完整路径
-4. 修改配置后重启 MaiBot 使配置生效
+1. `[trigger_timeout].command_total_timeout_sec` 控制命令链真实执行预算。
+2. `[host_timeout]` 只控制命令链内部宿主 LLM 单次请求预算。
+3. 命令桥外层 RPC 超时通过 Command 组件静态 `timeout_ms` 元数据声明更高上限，避免默认 60000ms 抢先超时。
 
-### 视频下载失败
+## 缓存规则
 
-**可能原因**：
-- 触发 B站风控（常见状态码：`412`）
-- 视频有地区限制或版权限制
-- 网络连接问题
+1. 视频缓存除了 `video_id/page`，还会绑定配置指纹，避免模型、提示词、ASR 开关变化后误用旧缓存。
+2. `card_visual_text` 属于当前消息上下文，不会写入视频级缓存。
+3. 当前消息带来的卡片预览图描述只参与本次结果装配，不跨消息复用。
+4. 当前消息带有卡片预览图描述时，不会直接复用不含该描述的历史总结缓存。
 
-**插件内置恢复策略（已自动执行）**：
-- 下载地址优先走 WBI 签名接口，失败自动回退旧接口
-- 对 `412` 执行定向恢复（刷新签名 key + 指数退避重试）
-- 重试后仍失败时自动降级到字幕模式或基础信息模式
+## 命令输出
 
-> 说明：`SESSDATA` 在本插件中主要用于字幕获取，不作为视频下载成功的前置条件。
+命令链总结失败但仍有原始信息时，会输出基础信息、原始内容详情和失败说明。原始内容详情只包含关键帧、卡片预览图描述、字幕和语音识别内容，不重复输出标题、UP 主、简介和时长。
 
-### 字幕获取失败
+## 宿主任务可用性
 
-**可能原因**：
-- 未配置 SESSDATA
-- SESSDATA 已过期（需要重新获取）
-- 视频本身没有字幕
+1. 插件不再静默切换到其它宿主任务。
+2. 视觉任务不可用时，会显式降级为 `none`。
+3. 总结任务不可用时，会显式关闭总结阶段并回退到原始信息或基础信息。
 
-### 视觉分析失败
+## 配置文件
 
-**可能原因**：
-- VLM API 配置错误
-- API 密钥无效或余额不足
-- 网络连接问题
+真实配置文件：
 
----
+`plugins/bilibili_video_parser_maisaka/config.toml`
 
+请直接编辑该文件。
 
+重点配置块：
 
----
-
-## 开源协议
-
-本插件采用 **GNU Affero General Public License v3.0 (AGPL-3.0)** 协议开源。
-
-```
-Copyright (C) 2024
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-```
-
-完整协议文本请参阅 [LICENSE](LICENSE) 文件。
+1. `[trigger_timeout]`：统一控制自动检测链与命令链的入口总预算。
+2. `[analysis]`：控制视觉模式，只允许 `host` 或 `none`。
+3. `[analysis.host]`：控制宿主视觉任务名与视觉提示词。
+4. `[host_timeout]`：控制宿主模型调用超时覆盖。
+5. `[asr]`：控制插件独立 ASR。
+6. `[summary]`：`summary_max_chars` 只进入 prompt，`max_tokens` 才是宿主模型真实生成预算。

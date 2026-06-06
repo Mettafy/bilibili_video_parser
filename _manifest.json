@@ -1,49 +1,42 @@
 {
-  "manifest_version": 1,
-  "name": "B站视频解析插件",
-  "version": "1.0.0",
-  "description": "解析B站视频内容并生成AI总结，支持视频抽帧、字幕获取、ASR识别，让麦麦能像人类一样理解视频",
+  "manifest_version": 2,
+  "version": "4.1.0",
+  "name": "B站视频插件 Maisaka 版",
+  "description": "让麦麦像人类一样看视频，支持自动检测、命令模式、视觉分析、字幕与 ASR。",
   "author": {
-    "name": "约瑟夫.k && 白泽",
+    "name": "白泽",
     "url": "https://github.com/Mettafy"
   },
   "license": "AGPL-3.0-or-later",
-  "keywords": [
-    "bilibili",
-    "B站",
-    "视频解析",
-    "视频总结",
-    "AI总结",
-    "VLM",
-    "字幕",
-    "ASR"
-  ],
-  "categories": [
-    "media",
-    "ai",
-    "utility"
-  ],
-  "host_application": {
-    "min_version": "0.11.0"
+  "urls": {
+    "repository": "https://github.com/Mettafy/bilibili_video_parser",
+    "homepage": "https://github.com/Mettafy/bilibili_video_parser",
+    "documentation": "https://github.com/Mettafy/bilibili_video_parser",
+    "issues": "https://github.com/Mettafy/bilibili_video_parser/issues"
   },
-  "homepage_url": "https://github.com/Mettafy/bilibili_video_parser",
-  "repository_url": "https://github.com/Mettafy/bilibili_video_parser",
-  "plugin_info": {
-    "is_built_in": false,
-    "plugin_type": "event_handler",
-    "components": [
-      {
-        "type": "event_handler",
-        "name": "bilibili_auto_detect",
-        "description": "自动检测并解析B站视频链接"
-      },
-      {
-        "type": "command",
-        "name": "bili",
-        "description": "手动触发B站视频解析",
-        "pattern": "/bili"
-      }
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.0.0"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "api.call",
+    "config.get",
+    "database.get",
+    "llm.generate",
+    "llm.get_available_models"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
     ]
   },
-  "id": "MaiBot.bilibili_video_parser"
+  "id": "mettafy.bilibili-video-parser-maisaka"
 }

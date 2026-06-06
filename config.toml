@@ -1,0 +1,253 @@
+# B站视频解析插件 Maisaka 版
+#
+# 本插件只负责拦截用户发来的 B 站链接，完成视频解析、字幕、视觉分析、ASR 与总结后，
+# 将处理后的文本重新写回消息上下文，再交给 Maisaka 主回复系统继续回复。
+
+[plugin]
+# 配置版本
+config_version = "4.2.0"
+
+# 是否启用插件
+enabled = true
+
+# 插件日志级别。
+# DEBUG：输出最详细的调试信息，适合排查问题。
+# INFO：输出常规运行信息，适合日常使用。
+# WARNING：只输出警告和错误。
+# ERROR：只输出错误。
+log_level = "INFO"
+
+# 是否启用调试模式
+debug = false
+
+[trigger]
+# 是否启用自动检测
+auto_detect_enabled = true
+
+# 是否启用 /bili 命令
+command_enabled = true
+
+# 是否在群聊中启用自动检测
+auto_detect_in_groups = true
+
+# 是否在私聊中启用自动检测
+auto_detect_in_private = true
+
+[trigger_timeout]
+# 自动检测链总超时（秒）。
+# 这是自然语言自动检测入口的严格总预算。
+# 插件会先准备 metadata 级结果，再在剩余预算内继续做字幕、视觉、ASR 与总结。
+# 当总超时发生时，只要 metadata 已经拿到，就会优先用基础信息重写用户消息。
+auto_detect_total_timeout_sec = 600
+
+# /bili 命令链总超时（秒）。
+# 这是命令链的真实执行预算；超过后命令链会停止后续处理并向用户返回失败结果。
+# 它和上面的自动检测链总预算属于同一类“入口链预算”，不属于宿主 LLM 单次请求预算。
+command_total_timeout_sec = 600
+
+[video]
+# 允许处理的视频最大时长（分钟）
+max_duration_min = 60.0
+
+# 允许下载的视频最大体积（MB）
+max_size_mb = 300
+
+# B站 SESSDATA。用于获取更完整的字幕；留空时将跳过需要登录权限的字幕。
+sessdata = ""
+
+# ffmpeg 路径。留空时自动从系统环境中检测。
+ffmpeg_path = ""
+
+# 常规 B站 API 超时（秒）
+api_timeout_sec = 15
+
+# 短链解析超时（秒）
+short_url_timeout_sec = 15
+
+# 字幕请求超时（秒）
+subtitle_timeout_sec = 20
+
+# 下载地址请求超时（秒）
+download_url_timeout_sec = 20
+
+# 视频下载超时（秒）
+download_timeout_sec = 300
+
+# ffprobe 探测超时（秒）
+ffmpeg_probe_timeout_sec = 20
+
+# 提取音频超时（秒）
+ffmpeg_extract_audio_timeout_sec = 120
+
+# 抽帧超时（秒）
+ffmpeg_extract_frames_timeout_sec = 180
+
+# 媒体总流程超时（秒）
+media_pipeline_timeout_sec = 360
+
+# B站请求最大重试次数
+retry_max_attempts = 3
+
+# B站请求重试间隔（秒）
+retry_interval_sec = 2.0
+
+[analysis]
+# 视觉分析方式。
+# host：使用 Maisaka 宿主已经配置好的视觉模型任务，通常是 vlm。
+# none：完全跳过视觉分析，只使用字幕、ASR、基础信息和总结链路。
+visual_method = "host"
+
+# 允许视觉分析的视频最大时长（分钟）
+visual_max_duration_min = 10.0
+
+# 最大抽帧数
+max_frames = 5
+
+# 是否锁定为等距抽帧
+lock_even_frames = true
+
+# 非等距模式的抽帧间隔（秒）
+frame_interval_sec = 10
+
+# 是否并发分析关键帧
+parallel_frame_analysis = false
+
+# 关键帧并发分析上限
+parallel_frame_analysis_limit = 2
+
+[analysis.host]
+# 宿主视觉任务名。通常使用 vlm。
+host_task_name = "vlm"
+
+# 宿主视觉请求温度
+temperature = 0.2
+
+# 宿主视觉请求最大输出
+max_tokens = 4000
+
+# 自定义关键帧分析提示词
+frame_prompt = ""
+
+[host_timeout]
+# 是否启用宿主 LLM 调用超时覆盖。
+# 关闭后，宿主 LLM 调用将退回 Runner 默认 RPC 超时。
+enabled = true
+
+# 宿主 LLM 单次请求超时（分钟）。
+# 用户填写分钟，插件内部会向上取整转换为毫秒后注入宿主 LLM capability 调用。
+# 例如：1.2 -> 72000ms，5.2 -> 312000ms。
+# 当前版本中，宿主任务发现和宿主文本生成共享这一套预算策略。
+# 当 enabled=false 时，宿主 LLM 调用都会退回 Runner 默认 RPC 超时。
+task_request_timeout_min = 5.0
+
+[auto_detect]
+# 自动检测时是否生成总结
+enable_summary = true
+
+[command]
+# 工具型命令链是否显示处理中提示
+show_processing_message = true
+
+# 是否允许命令链使用 --force-visual
+allow_force_visual = true
+
+# 是否允许命令链使用 --force-asr
+allow_force_asr = true
+
+# 是否允许命令链保留额外参数
+allow_extra_arguments = true
+
+[asr]
+# 是否启用插件独立 ASR
+enabled = false
+
+# ASR 供应商类型。
+# openai_compatible：使用 OpenAI 兼容音频转写接口。
+provider_type = "openai_compatible"
+
+# 插件独立 ASR 服务地址
+base_url = ""
+
+# 插件独立 ASR API 密钥
+api_key = ""
+
+# ASR 模型名
+model = "whisper-1"
+
+# ASR 请求超时（秒）
+timeout_sec = 120
+
+# ASR 最大重试次数
+max_retries = 2
+
+# ASR 重试间隔（秒）
+retry_interval_sec = 5.0
+
+# 允许 ASR 的最大音频时长（分钟）
+max_audio_duration_min = 30.0
+
+# ASR 语言
+language = "zh"
+
+# ASR 识别提示词
+prompt = ""
+
+# ASR 失败时是否仅保留字幕
+fallback_to_subtitle_only = true
+
+[summary]
+# 是否启用总结生成
+enabled = true
+
+# 宿主总结任务名。通常使用 replyer。
+# 该任务只负责视频内容总结，不承担 bot 人设化聊天回复职责。
+host_task_name = "replyer"
+
+# 总结请求温度
+temperature = 0.4
+
+# 总结请求最大输出
+# 这是宿主模型真实生成预算，会直接作为 max_tokens 传给宿主 LLM 请求。
+max_tokens = 7000
+
+# 总结目标字数提示
+# 该值只写进 prompt，告诉模型尽量生成多少字。
+# 它不是插件硬限制，不参与返回结果裁剪，也不参与 max_tokens 压缩。
+summary_max_chars = 200
+
+# 总结失败时是否回退原始信息
+fallback_to_raw_info = true
+
+# 自定义总结提示词
+custom_prompt = ""
+
+[cache]
+# 是否启用缓存
+enabled = true
+
+# 当前版本中，视频缓存会绑定配置指纹。
+# 这可以避免总结任务、提示词、视觉策略或 ASR 开关变化后误用旧缓存。
+# 当前消息里的 card_visual_text 不会写入视频级缓存。
+
+# 是否缓存总结
+cache_summary = true
+
+# 是否缓存原始信息
+cache_raw_info = true
+
+# 是否缓存视觉分析结果
+cache_visual_result = true
+
+# 是否缓存字幕
+cache_subtitle = true
+
+# 是否缓存 ASR
+cache_asr = true
+
+# 临时文件最大保留时间（分钟）
+# 设为 0 表示处理完成后立即删除；大于 0 表示保留对应分钟数，并由后台定时清理任务清除。
+temp_file_max_age_min = 60
+
+# 是否允许在 temp_file_max_age_min=0 时处理成功后立刻清理临时文件。
+# 该项只影响“即时删除模式”，不会替代定时清理逻辑。
+cleanup_on_success = true
